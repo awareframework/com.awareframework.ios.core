@@ -5,13 +5,8 @@
 ## Overview
 com.awareframework.ios.sensor.core provides a basic class for developing your own sensor module on aware framework.
 
-## Example
-
-To run the example project, clone the repo, and run `pod install` from the Example directory first.
-
 ## Requirements
 iOS 13 or later.
-
 
 ## Installation
 
@@ -26,18 +21,11 @@ You can integrate this framework into your project via Swift Package Manager (Sw
 3. Import the package into your target.
 
 
-
-### Extending to a new AWARE module
-1. Make a subclass of AwareSensor as a sensor module
-2. Extende SensorConfig for adding originl parameters 
-3. Store data using the provided database engine
-4. Sync local-database with remote-database
-
 ## Author
 Yuuki Nishiyama (The University of Tokyo), nishiyama@csis.u-tokyo.ac.jp
 
 ## License
-Copyright (c) 2014 AWARE Mobile Context Instrumentation Middleware/Framework (http://www.awareframework.com)
+Copyright (c) 2025 AWARE Mobile Context Instrumentation Middleware/Framework (http://www.awareframework.com)
 
 Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License. You may obtain a copy of the License at
 
