@@ -7,7 +7,6 @@
 
 import Foundation
 import CommonCrypto
-import RealmSwift
 
 
 public typealias DictToModelHandler = (_ dict:Dictionary<String, Any>) -> Any
@@ -16,7 +15,6 @@ public typealias ModelToDictHandler = (Any) -> Dictionary<String,Any>
 
 public enum DatabaseType {
     case NONE
-    case REALM
     case SQLite
     // case CSV
 }
@@ -60,8 +58,6 @@ open class Engine: EngineProtocal {
         open var path:String?
         open var host:String?
         open var tableName:String?
-        
-        open var realmObjectType:Object.Type?
     }
     
     open class Builder {
@@ -97,17 +93,11 @@ open class Engine: EngineProtocal {
             return self
         }
         
-        public func setRealObjectType(_ realmObjectType: Object.Type?) -> Builder {
-            config.realmObjectType = realmObjectType
-            return self
-        }
         
         public func build() -> Engine {
             switch config.type {
             case DatabaseType.NONE:
                 return Engine.init(EngineConfig())
-            case DatabaseType.REALM:
-                return RealmEngine.init(self.config)
             case DatabaseType.SQLite:
                 return SQLiteEngine.init(self.config)
             }

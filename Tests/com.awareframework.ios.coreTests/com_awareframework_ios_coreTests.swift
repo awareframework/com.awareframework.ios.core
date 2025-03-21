@@ -1,7 +1,6 @@
 import XCTest
 @testable import com_awareframework_ios_core
 
-import RealmSwift
 import GRDB
 
 class UnitTests: XCTestCase {
@@ -9,7 +8,6 @@ class UnitTests: XCTestCase {
     override func setUp() {
         super.setUp()
         // Put setup code here. This method is called before the invocation of each test method in the class.
-        Realm.Configuration.defaultConfiguration.inMemoryIdentifier = self.name
     }
     
     override func tearDown() {
@@ -37,7 +35,7 @@ class UnitTests: XCTestCase {
         let config = SensorConfig.init()
         config.dbHost = "sample.server.awareframework.com"
         config.dbPath = "aware_hoge"
-        config.dbType = DatabaseType.REALM
+        config.dbType = DatabaseType.SQLite
         config.dbEncryptionKey = "testtest"
         sensor.initializeDbEngine(config: config)
         XCTAssertEqual(config.dbHost!, sensor.dbEngine?.config.host!)
@@ -96,22 +94,15 @@ class UnitTests: XCTestCase {
     
     func testInitializationOnSetConfig(){
         // DatabaseType based DB Type setting (NONE)
-        var config = SensorConfig(["dbType":DatabaseType.NONE]);
+        let config = SensorConfig(["dbType":DatabaseType.NONE]);
         XCTAssertEqual(config.dbType, DatabaseType.NONE)
-        
-        // DatabaseType based DB Type setting (REALM)
-        config = SensorConfig(["dbType":DatabaseType.REALM]);
-        XCTAssertEqual(config.dbType, DatabaseType.REALM)
         
         // Int based DB Type setting (NONE)
         config.set(config: ["dbType":0])
         XCTAssertEqual(config.dbType, DatabaseType.NONE)
         
-        // Int based DB Type setting (REALM)
-        config.set(config: ["dbType":1])
-        XCTAssertEqual(config.dbType, DatabaseType.REALM)
         
-        config.set(config: ["dbType":2])
+        config.set(config: ["dbType":1])
         XCTAssertEqual(config.dbType, DatabaseType.SQLite)
         
         config.set(config: ["dbType":DatabaseType.SQLite])
@@ -136,157 +127,7 @@ class UnitTests: XCTestCase {
         XCTAssertEqual(newUrl, hostName)
     }
 
-    
-    func testRealmEngines(){
-        // remove old database
-        let documentDirFileURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).last!
-        let url = documentDirFileURL.appendingPathComponent("sample.realm")
-        do {
-            try FileManager.default.removeItem(at: url)
-        }catch{
-            print(error)
-        }
-        
-        let dbType = DatabaseType.REALM
-        print("Setup Engine:", dbType)
-        
-        let engine = Engine.Builder()
-                                .setType(dbType)
-                                .setPath("sample")
-                                .setRealObjectType(BaseDbModelRealm.self)
-                                .build()
-        
-        print("Setup Realm Engine Converters:", dbType)
-        engine.dictToModelHandler = { (data:Dictionary<String, Any>) -> Any in
-            let r = BaseDbModelRealm()
-            r.fromDictionary(data)
-            return r
-        }
-        engine.modelToDictHandler = { (data:Any) -> Dictionary<String, Any> in
-            return (data as! BaseDbModelRealm).toDictionary()
-        }
-        
 
-        
-        print("Insert data into Real Engine-based DB (in the main thread)")
-        // data save on main thread
-        let number = 100
-        for _ in 0..<number {
-            let event = BaseDbModelRealm()
-            engine.save(event.toDictionary())
-        }
-        let results = engine.fetch(filter: nil, limit: nil)
-        XCTAssertEqual((results ?? []).count, 100)
-        
-        
-        
-        print("Insert data into Real Engine-based DB (in a sub-thread)")
-        // data save on sub-thread
-        let realmExpect = XCTestExpectation.init(description: "sub thread realm engin test")
-        let queue = OperationQueue()
-        queue.addOperation {
-            for _ in 0..<number {
-                let event = BaseDbModelRealm()
-                engine.save(event.toDictionary())
-            }
-            let results3 = engine.fetch(filter: nil, limit: nil)
-            XCTAssertEqual((results3 ?? []).count, 200)
-            realmExpect.fulfill()
-        }
-        wait(for: [realmExpect], timeout: 10)
-
-        
-        engine.fetch(filter: nil, limit: 30) { (resultsObject, error) in
-            if let results = resultsObject{
-                XCTAssertEqual(results.count, 30)
-            }else{
-                XCTFail()
-            }
-        }
-
-        engine.removeAll(){ error in
-            XCTAssertNil(error)
-        }
-    
-        let a = BaseDbModelRealm()
-        a.timestamp = 1
-        engine.save(a.toDictionary())
-        let result3 = engine.fetch(filter: "timestamp > 0", limit: 1)
-        if let r = result3 {
-            XCTAssertEqual(r.count, 1)
-        }else{
-            XCTFail()
-        }
-         
-        // You can access Realm directoly
-        if let realmEngine = engine as? RealmEngine {
-            if let realm = realmEngine.getRealmInstance(){
-                do{
-                    let object1 = BaseDbModelRealm()
-                    // use write scope
-                    try realm.write {
-                        realm.add(object1)
-                        realm.delete(object1)
-                    }
-
-                    // use transaction
-                    realm.beginWrite()
-                    let object2 = BaseDbModelRealm()
-                    realm.add(object2)
-                    realm.delete(object2)
-                    try realm.commitWrite()
-                }catch{
-                    print(error)
-                }
-            }
-        }
-        
-        print("---------")
-        
-        engine.removeAll()
-        
-        if let realm = (engine as! RealmEngine).getRealmInstance() {
-            do {
-                try realm.write({
-                    for _ in 0..<10 {
-                        let obj = BaseDbModelRealm()
-                        obj.setAutoIncrementId(tableName: "abc")
-                        realm.add(obj)
-                    }
-                })
-                } catch  {
-                print(error)
-            }
-
-            let results = realm.objects(BaseDbModelRealm.self)
-            for r in results {
-                print(r["id"] ?? 0)
-            }
-            
-            do {
-                try realm.write {
-                    realm.delete(results.prefix(5))
-                }
-            } catch  {
-                print(error)
-            }
-            
-
-            
-            realm.refresh()
-        }
-        
-        print("======")
-        
-        if let realm3 = (engine as! RealmEngine).getRealmInstance() {
-            let results = realm3.objects(BaseDbModelRealm.self)
-            for r in results.prefix(5) {
-                print(r["id"] ?? 0)
-            }
-        }
-        
-        
-    }
     
     
     func testSQLiteEngines(){
@@ -361,8 +202,9 @@ class UnitTests: XCTestCase {
         return A.init( Dictionary<String, Any>() )
     }
     
-    struct A:BaseDbModelSQLiteProtocol {
+    struct A:Codable, BaseDbModelSQLiteProtocol {
 
+        var id:Int64?
         var timestamp: Int64 = Int64(Date().timeIntervalSince1970*1000)
         var deviceId: String = AwareUtils.getCommonDeviceId()
         var label: String = ""
@@ -373,6 +215,9 @@ class UnitTests: XCTestCase {
         init(){}
         
         init(_ dict: Dictionary<String, Any>) {
+//            if let id = dict["id"] as? Int64{
+//                self.id = id
+//            }
             if let timestamp = dict["timestamp"] as? Int64 {
                 self.timestamp = timestamp
             }
@@ -391,12 +236,15 @@ class UnitTests: XCTestCase {
         }
         
         func toDictionary() -> Dictionary<String, Any> {
-            return ["timestamp":timestamp,
-                    "deviceId": deviceId,
-                    "label": label,
-                    "timezone": timezone,
-                    "os":os,
-                    "jsonVersion":jsonVersion]
+            let dict = [
+                "id":id ?? -1,
+                "timestamp":timestamp,
+                "deviceId": deviceId,
+                "label": label,
+                "timezone": timezone,
+                "os":os,
+                "jsonVersion":jsonVersion] as [String : Any]
+            return dict
         }
         
         static func createTable(queue: GRDB.DatabaseQueue) {
@@ -425,56 +273,55 @@ class UnitTests: XCTestCase {
         let sensor = AwareSensor()
         let config = SensorConfig()
         config.dbHost = "node.awareframework.com:1001"
-        config.dbType = .REALM
-        config.debug = true
+        config.dbType = .SQLite
+        config.debug  = true
         config.dbPath = "a"
-        config.realmObjectType = AccelerometerDbModelRealm.self
+        config.dbTableName = A.databaseTableName
+        
+        XCTAssertTrue(config.verify())
+
         sensor.initializeDbEngine(config: config )
+        
+        
+        guard let query = (sensor.dbEngine as! SQLiteEngine).getSQLiteInstance() else { return  }
+        A.createTable(queue: query)
         
         if let engine = sensor.dbEngine {
             engine.dictToModelHandler = {dict in
-                if config.dbType == .REALM {
-                    let model = AccelerometerDbModelRealm()
-                    model.fromDictionary(dict)
-                    return model
-                }else{
-                    let model = AccelerometerDbModelSQLite(dict)
-                    return model
-                }
+                let model = A(dict)
+                return model
             }
             
             engine.modelToDictHandler = {data in
-                return (data as! AccelerometerDbModelRealm).toDictionary()
+                return (data as! A).toDictionary()
             }
             
             var data:Array<Dictionary<String, Any>> = []
             for _ in 0..<24 {
-                data.append(AccelerometerDbModelRealm().toDictionary())
+                data.append(getSmapleData().toDictionary())
             }
             engine.save(data)
 
         }
-        //    TODO: removeAfterSync x Realmの時にデータがうまくフェッチできない
         
         let expectation = XCTestExpectation.init(description: "sync task")
-        let helper:RealmDbSyncHelper = RealmDbSyncHelper.init(engine: sensor.dbEngine!,
-                                    host: config.dbHost!,
-                                    tableName: "accelerometer",
-                                   config: DbSyncConfig().apply{setting in
-                                                setting.batchSize = 5
-                                                setting.removeAfterSync = true
-                                                setting.debug = true
-                                                setting.test = true
-                                                setting.compactDataFormat = false
-                                                setting.dispatchQueue = DispatchQueue(label: "com.awareframework.ios.sensor.core.syncTask")
-        })
-        AccelerometerDbModelRealm().resetAutoIncrementId(tableName: "accelerometer")
+        let helperConfig = DbSyncConfig().apply{setting in
+            setting.batchSize = 5
+            setting.removeAfterSync = true
+            setting.debug = true
+            setting.test = true
+            setting.compactDataFormat = false
+            setting.dispatchQueue = DispatchQueue(label: "com.awareframework.ios.sensor.core.syncTask")
+        }
+        let helper = DbSyncHelper.init(engine: sensor.dbEngine!,
+                                         host: config.dbHost!,
+                                    tableName: A.databaseTableName,
+                                       config: helperConfig)
+        helper.createHttpRequestBodyHandler = { body in
+            print(body)
+            return body
+        }
         
-//        helper.createHttpRequestBodyHandler = { body in
-//            print(body)
-//            return body
-//        }
-//        
         helper.run(completion: { (status, error) in
             XCTAssertTrue(status)
             XCTAssertNil(error)
@@ -524,7 +371,6 @@ class UnitTests: XCTestCase {
         // The key is saved on iCloud
         let uuid = AwareUtils.getCommonDeviceId()
         for i in 0..<10 {
-            print("[\(i)]",uuid)
             if(uuid == AwareUtils.getCommonDeviceId()){
                 XCTAssertNoThrow(uuid)
             }else{
@@ -594,9 +440,8 @@ class SensorTests: XCTestCase {
     override func setUp() {
         super.setUp()
         // Put setup code here. This method is called before the invocation of each test method in the class.
-        Realm.Configuration.defaultConfiguration.inMemoryIdentifier = self.name
-
-        for dbName in ["accelerometer.sqlite", "accelerometer.realm"] {
+        
+        for dbName in ["accelerometer.sqlite"] {
             removeDatabases(dbName)
         }
     }
@@ -621,10 +466,6 @@ class SensorTests: XCTestCase {
         initAndRunSensor(dbType: .SQLite)
     }
     
-    func testSensorInitWithRealmEngine(){
-        initAndRunSensor(dbType: .REALM)
-    }
-    
     func initAndRunSensor(dbType:DatabaseType){
         let sensor = AccelerometerSensor(AccelerometerSensor.Config.init().apply(closure: { config in
             config.frequency = 100
@@ -632,7 +473,6 @@ class SensorTests: XCTestCase {
             config.debug = true
             config.dbPath = "accelerometer"
             config.dbTableName = AccelerometerDbModelSQLite.databaseTableName
-            config.realmObjectType = AccelerometerDbModelRealm.self
         }))
         
         if let sqliteEngine = sensor.dbEngine as? SQLiteEngine {
@@ -642,20 +482,14 @@ class SensorTests: XCTestCase {
         }
         
         sensor.dbEngine?.dictToModelHandler = { dict in
-            if sensor.CONFIG.dbType == .REALM {
-                let model = AccelerometerDbModelRealm()
-                return model
-            }else{
+            if sensor.CONFIG.dbType == .SQLite {
                 let model = AccelerometerDbModelSQLite(dict)
                 return model
             }
+            return []
         }
         
         sensor.dbEngine?.modelToDictHandler = {model in
-            if let model = model as? AccelerometerDbModelRealm {
-                return model.toDictionary()
-            }
-            
             if let model = model as? AccelerometerDbModelSQLite {
                 return model.toDictionary()
             }
@@ -866,8 +700,9 @@ class AccelerometerSensor:AwareSensor {
 }
 
 
-struct AccelerometerDbModelSQLite: BaseDbModelSQLiteProtocol {
+struct AccelerometerDbModelSQLite: Codable, BaseDbModelSQLiteProtocol {
 
+    var id: Int64?
     var timestamp: Int64
     var deviceId: String
     var label: String
@@ -904,6 +739,7 @@ struct AccelerometerDbModelSQLite: BaseDbModelSQLiteProtocol {
     
     func toDictionary() -> Dictionary<String, Any> {
         return [
+            "id": self.id ?? -1,
             "timestamp":timestamp,
             "deviceId":deviceId,
             "label":label,
@@ -941,30 +777,4 @@ struct AccelerometerDbModelSQLite: BaseDbModelSQLiteProtocol {
     static var databaseTableName: String {
         return "accelerometer"
     }
-}
-
-
-class AccelerometerDbModelRealm:BaseDbModelRealm {
-    @objc dynamic public var x:Double = 0
-    @objc dynamic public var y:Double = 0
-    @objc dynamic public var z:Double = 0
-    
-    override func toDictionary() -> Dictionary<String, Any> {
-        var dict = super.toDictionary()
-        dict["x"] = self.x
-        dict["y"] = self.y
-        dict["z"] = self.z
-        return dict
-    }
-    
-    override func fromDictionary(_ dict: Dictionary<String, Any>) {
-        super.fromDictionary(dict)
-        self.x = dict["x"] as? Double ?? 0
-        self.y = dict["y"] as? Double ?? 0
-        self.z = dict["z"] as? Double ?? 0
-    }
-    
-//    override static func className() -> String {
-//        return "accelerometer"
-//    }
 }

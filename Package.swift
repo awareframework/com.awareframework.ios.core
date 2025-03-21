@@ -13,7 +13,6 @@ let package = Package(
             targets: ["com.awareframework.ios.core"]),
     ],
     dependencies: [
-        .package(url: "git@github.com:realm/realm-swift.git", from: "20.0.0"),
         .package(url: "git@github.com:SwiftyJSON/SwiftyJSON.git", from: "5.0.2"),
         .package(url: "git@github.com:groue/GRDB.swift.git", from: "7.3.0"),
     ],
@@ -21,7 +20,6 @@ let package = Package(
         .target(
             name: "com.awareframework.ios.core",
             dependencies: [
-                .product(name: "RealmSwift", package: "realm-swift"),
                 .product(name: "SwiftyJSON", package: "SwiftyJSON"),
                 .product(name: "GRDB", package: "GRDB.swift")
             ]),

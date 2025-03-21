@@ -6,7 +6,6 @@
 //
 
 import Foundation
-import RealmSwift
 
 public protocol ISensorController {
     var  id:String {get}
@@ -47,7 +46,6 @@ open class AwareSensor: NSObject,ISensorController {
             .setHost(config.dbHost)
             .setEncryptionKey(config.dbEncryptionKey)
             .setTableName(config.dbTableName)
-            .setRealObjectType(config.realmObjectType)
             .build()
     }
     

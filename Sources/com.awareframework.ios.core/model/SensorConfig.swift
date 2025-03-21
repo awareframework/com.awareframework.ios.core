@@ -6,7 +6,6 @@
 //
 
 import Foundation
-import RealmSwift
 
 open class SensorConfig{
     
@@ -20,7 +19,6 @@ open class SensorConfig{
     public var dbHost:String? = nil
     
     public var dbTableName:String? = nil
-    public var realmObjectType:Object.Type? = nil
     
     public convenience init(dbType:DatabaseType = .NONE,
                 deviceId:String? = nil,
@@ -30,8 +28,7 @@ open class SensorConfig{
                 label:String? = nil,
                 dbEncryptionKey:String? = nil,
                 dbHost:String? = nil,
-                dbTableName:String,
-                realmObjctType:Object.Type? = nil){
+                dbTableName:String){
         self.init()
         self.deviceId = deviceId ?? AwareUtils.getCommonDeviceId()
         self.dbPath = dbPath ?? "aware"
@@ -43,7 +40,6 @@ open class SensorConfig{
         self.dbHost = dbHost
         self.dbTableName = dbTableName
 
-        self.realmObjectType = realmObjctType
     }
     
     public convenience init(_ config:Dictionary<String,Any>){
@@ -74,8 +70,6 @@ open class SensorConfig{
             if dbType == 0 {
                 self.dbType = DatabaseType.NONE
             }else if dbType == 1 {
-                self.dbType = DatabaseType.REALM
-            }else if dbType == 2 {
                 self.dbType = DatabaseType.SQLite
             }
         }
@@ -99,18 +93,10 @@ open class SensorConfig{
     }
     
     public func verify() -> Bool{
-        if self.dbType == .REALM {
-            if self.realmObjectType == nil {
-                print("[Error][SensorConfig] `realmObjectType` is required for Realm-based engine.")
-                return false
-            }
-        }
-        
         if self.dbTableName == nil {
             print("[Error][SensorConfig] `dbTableName` is required parameter.")
             return false
         }
-        
         return true
     }
 }

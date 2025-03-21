@@ -82,7 +82,6 @@ open class DbSyncHelper: NSObject, URLSessionDelegate, URLSessionDataDelegate, U
     
     open func getUploadCandidates(lastUploadedId:Int64, limit:Int) -> Array<Dictionary<String, Any>>{
         let filter = "id > \(lastUploadedId)"
-        // TODO: ここの取得方法をengineによって変更する
         let candidates = self.engine.fetch(filter: filter, limit:limit)
         return candidates ?? []
     }
@@ -150,11 +149,11 @@ open class DbSyncHelper: NSObject, URLSessionDelegate, URLSessionDataDelegate, U
                         }
                     }
                 }
-                let requestObject = try JSONSerialization.data(withJSONObject:aggregatedData)
-                data = String(data: requestObject, encoding: .utf8)!
+                let jsonData = try JSONSerialization.data(withJSONObject:aggregatedData)
+                data = String(data: jsonData, encoding: .utf8)!
             }else{
-                let requestObject = try JSONSerialization.data(withJSONObject:candidates)
-                data = String(data: requestObject, encoding: .utf8)!
+                let jsonData = try JSONSerialization.data(withJSONObject: candidates, options: [])
+                data = String(data: jsonData, encoding: .utf8)!
             }
             
             /// main body

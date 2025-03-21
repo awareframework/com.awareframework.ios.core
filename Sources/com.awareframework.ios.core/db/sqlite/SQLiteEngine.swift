@@ -84,7 +84,6 @@ open class SQLiteEngine: Engine {
     }
 
     public override func fetch(filter: String?=nil, limit:Int?=nil) -> Array<Dictionary<String,Any>>? {
-        /// NOTE: table生のsql文を利用するので、transformationを利用する必要は無い
         let instance = self.getSQLiteInstance()
         if let tableName = self.config.tableName {
             do {
@@ -98,12 +97,17 @@ open class SQLiteEngine: Engine {
                     }
                     
                     let cursor = try Row.fetchCursor(db, sql: sql)
-                    let enumeratedCursor = cursor.enumerated()
-                    var results:Array<Dictionary<String, Any>> = []
-                    while let (_, element) = try enumeratedCursor.next() {
-                        let elementDict = elementToDictionary(element)
-                        results.append(elementDict)
+                    
+                    // convert Row to Dict
+                    var results: [[String: Any]] = []
+                    while let row = try cursor.next() {
+                        var dict: [String: Any] = [:]
+                        for column in row.columnNames {
+                            dict[column] = row[column]
+                        }
+                        results.append(dict)
                     }
+                    
                     return results
                 }
                 return queryResult
