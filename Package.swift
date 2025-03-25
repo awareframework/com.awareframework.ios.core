@@ -13,8 +13,8 @@ let package = Package(
             targets: ["com.awareframework.ios.core"]),
     ],
     dependencies: [
-        .package(url: "git@github.com:SwiftyJSON/SwiftyJSON.git", from: "5.0.2"),
-        .package(url: "git@github.com:groue/GRDB.swift.git", from: "7.3.0"),
+        .package(url: "https://github.com/SwiftyJSON/SwiftyJSON.git", from: "5.0.2"),
+        .package(url: "https://github.com/groue/GRDB.swift.git", from: "7.3.0"),
     ],
     targets: [
         .target(
