@@ -9,7 +9,7 @@
 import Foundation
 import GRDB
 
-public protocol BaseDbModelSQLiteProtocol: Codable, FetchableRecord, PersistableRecord {
+public protocol BaseDbModelSQLite: Codable, FetchableRecord, PersistableRecord {
     var id: Int64? {get}
     var timestamp: Int64 { get }
     var deviceId: String { get }

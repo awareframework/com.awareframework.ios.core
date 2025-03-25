@@ -57,7 +57,6 @@ open class SQLiteEngine: Engine {
                 try instance?.write{ db in
                     for d in data {
                         if let result = handler(d) as? PersistableRecord {
-                            
                             try result.insert(db)
                         }
                     }
@@ -70,18 +69,22 @@ open class SQLiteEngine: Engine {
         }
     }
     
-    func elementToDictionary(_ element: Any) -> [String: Any] {
-        let mirror = Mirror(reflecting: element)
-        var dict: [String: Any] = [:]
-        
-        for child in mirror.children {
-            if let key = child.label {
-                dict[key] = child.value
+    open func save(_ data: Array<BaseDbModelSQLite>, completion:((Error?)->Void)?){
+        do {
+            let instance = self.getSQLiteInstance()
+            try instance?.write{ db in
+                for d in data {
+                    try d.insert(db)
+                }
             }
+            if let completion = completion {
+                completion(nil)
+            }
+        }catch {
+            print(error)
         }
-        
-        return dict
     }
+
 
     public override func fetch(filter: String?=nil, limit:Int?=nil) -> Array<Dictionary<String,Any>>? {
         let instance = self.getSQLiteInstance()
@@ -115,8 +118,6 @@ open class SQLiteEngine: Engine {
                 print(error)
             }
         }
-        
-        
         return nil
     }
     

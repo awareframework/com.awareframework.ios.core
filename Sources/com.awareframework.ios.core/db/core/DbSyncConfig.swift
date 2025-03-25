@@ -48,6 +48,7 @@ public class DbSyncConfig {
     public var dispatchQueue:DispatchQueue? = nil
     public var backgroundSession    = true
     public var compactDataFormat    = false
+    public var serverType:ServerType = .aware
     
     public var test = false
     
@@ -88,6 +89,22 @@ public class DbSyncConfig {
         
         if let test = config["test"] as? Bool {
             self.test = test
+        }
+        
+        if let serverType = config["serverType"] as? Int {
+            if serverType == 0 {
+                self.serverType = .none
+            } else if serverType == 1 {
+                self.serverType = .aware
+            } else if serverType == 2 {
+                self.serverType = .aware_micro
+            } else if serverType == 3 {
+                self.serverType = .aware_x
+            } else if serverType == 4 {
+                self.serverType = .aware_light
+            } else {
+                self.serverType = .aware
+            }
         }
     }
     

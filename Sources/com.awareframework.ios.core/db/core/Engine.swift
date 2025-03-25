@@ -14,9 +14,17 @@ public typealias ModelToDictHandler = (Any) -> Dictionary<String,Any>
 //public typealias TargetTableFormatTransformationHandler = (_ tableName:String) -> Any
 
 public enum DatabaseType {
-    case NONE
-    case SQLite
+    case none
+    case sqlite
     // case CSV
+}
+
+public enum ServerType {
+    case none
+    case aware       // for the original php-based aware server
+    case aware_micro // for Kottlin-based aware server
+    case aware_x     // for Python(Flask)-based aware server
+    case aware_light
 }
 
 public protocol EngineProtocal {
@@ -53,7 +61,7 @@ open class Engine: EngineProtocal {
     }
     
     open class EngineConfig{
-        open var type: DatabaseType = DatabaseType.SQLite
+        open var type: DatabaseType = .sqlite
         open var encryptionKey:String?
         open var path:String?
         open var host:String?
@@ -96,9 +104,9 @@ open class Engine: EngineProtocal {
         
         public func build() -> Engine {
             switch config.type {
-            case DatabaseType.NONE:
+            case DatabaseType.none:
                 return Engine.init(EngineConfig())
-            case DatabaseType.SQLite:
+            case DatabaseType.sqlite:
                 return SQLiteEngine.init(self.config)
             }
         }

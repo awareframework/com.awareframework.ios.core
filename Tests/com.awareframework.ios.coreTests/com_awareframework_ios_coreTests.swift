@@ -28,14 +28,14 @@ class UnitTests: XCTestCase {
         let sensor2 = AwareSensor.init()
         sensor2.initializeDbEngine(config: SensorConfig())
         XCTAssertNil(sensor2.dbEngine?.config.encryptionKey)
-        XCTAssertNil(sensor2.dbEngine?.config.path)
+        XCTAssertEqual(sensor2.dbEngine?.config.path, "aware")
         XCTAssertNil(sensor2.dbEngine?.config.host)
-        XCTAssertEqual(sensor2.dbEngine?.config.type, DatabaseType.SQLite)
+        XCTAssertEqual(sensor2.dbEngine?.config.type, DatabaseType.sqlite)
         
         let config = SensorConfig.init()
         config.dbHost = "sample.server.awareframework.com"
         config.dbPath = "aware_hoge"
-        config.dbType = DatabaseType.SQLite
+        config.dbType = DatabaseType.sqlite
         config.dbEncryptionKey = "testtest"
         sensor.initializeDbEngine(config: config)
         XCTAssertEqual(config.dbHost!, sensor.dbEngine?.config.host!)
@@ -94,19 +94,19 @@ class UnitTests: XCTestCase {
     
     func testInitializationOnSetConfig(){
         // DatabaseType based DB Type setting (NONE)
-        let config = SensorConfig(["dbType":DatabaseType.NONE]);
-        XCTAssertEqual(config.dbType, DatabaseType.NONE)
+        let config = SensorConfig(["dbType":DatabaseType.none]);
+        XCTAssertEqual(config.dbType, DatabaseType.none)
         
         // Int based DB Type setting (NONE)
         config.set(config: ["dbType":0])
-        XCTAssertEqual(config.dbType, DatabaseType.NONE)
+        XCTAssertEqual(config.dbType, DatabaseType.none)
         
         
         config.set(config: ["dbType":1])
-        XCTAssertEqual(config.dbType, DatabaseType.SQLite)
+        XCTAssertEqual(config.dbType, DatabaseType.sqlite)
         
-        config.set(config: ["dbType":DatabaseType.SQLite])
-        XCTAssertEqual(config.dbType, DatabaseType.SQLite)
+        config.set(config: ["dbType":DatabaseType.sqlite])
+        XCTAssertEqual(config.dbType, DatabaseType.sqlite)
     }
     
     func testMethodsOnUtils(){
@@ -140,7 +140,7 @@ class UnitTests: XCTestCase {
             print(error)
         }
         
-        let dbType = DatabaseType.SQLite
+        let dbType = DatabaseType.sqlite
         print("Setup Engine:", dbType)
         
         let tableName = A.databaseTableName
@@ -202,7 +202,7 @@ class UnitTests: XCTestCase {
         return A.init( Dictionary<String, Any>() )
     }
     
-    struct A:Codable, BaseDbModelSQLiteProtocol {
+    struct A:BaseDbModelSQLite{
 
         var id:Int64?
         var timestamp: Int64 = Int64(Date().timeIntervalSince1970*1000)
@@ -273,7 +273,7 @@ class UnitTests: XCTestCase {
         let sensor = AwareSensor()
         let config = SensorConfig()
         config.dbHost = "node.awareframework.com:1001"
-        config.dbType = .SQLite
+        config.dbType = .sqlite
         config.debug  = true
         config.dbPath = "a"
         config.dbTableName = A.databaseTableName
@@ -370,7 +370,7 @@ class UnitTests: XCTestCase {
         
         // The key is saved on iCloud
         let uuid = AwareUtils.getCommonDeviceId()
-        for i in 0..<10 {
+        for _ in 0..<10 {
             if(uuid == AwareUtils.getCommonDeviceId()){
                 XCTAssertNoThrow(uuid)
             }else{
@@ -463,7 +463,7 @@ class SensorTests: XCTestCase {
     }
     
     func testSensorInitWithSQLiteEngine(){
-        initAndRunSensor(dbType: .SQLite)
+        initAndRunSensor(dbType: .sqlite)
     }
     
     func initAndRunSensor(dbType:DatabaseType){
@@ -482,7 +482,7 @@ class SensorTests: XCTestCase {
         }
         
         sensor.dbEngine?.dictToModelHandler = { dict in
-            if sensor.CONFIG.dbType == .SQLite {
+            if sensor.CONFIG.dbType == .sqlite {
                 let model = AccelerometerDbModelSQLite(dict)
                 return model
             }
@@ -673,6 +673,7 @@ class AccelerometerSensor:AwareSensor {
     public override func sync(force: Bool = false) {
         if let engine = self.dbEngine {
             engine.startSync(DbSyncConfig().apply(closure: { config in
+                config.serverType = config.serverType
                 config.debug = true
                 config.batchSize = 100
                 config.dispatchQueue = DispatchQueue(label: "com.awareframework.ios.sensor.accelerometer.sync.queue")
@@ -700,7 +701,7 @@ class AccelerometerSensor:AwareSensor {
 }
 
 
-struct AccelerometerDbModelSQLite: Codable, BaseDbModelSQLiteProtocol {
+struct AccelerometerDbModelSQLite: Codable, BaseDbModelSQLite {
 
     var id: Int64?
     var timestamp: Int64

@@ -1,5 +1,5 @@
 
-name: iOS CI
+name: iOS Tests for Aware Core
 
 on: [push, pull_request]
 
@@ -8,27 +8,37 @@ jobs:
     runs-on: macos-latest
 
     steps:
-    - uses: actions/checkout@v2
+    - name: Checkout code
+      uses: actions/checkout@v3
 
     - name: Install xcpretty
       run: gem install xcpretty
 
-    # - name: Set up Xcode
-    #   run: sudo xcode-select -s /Applications/Xcode_12.5.app
+    - name: Set up Xcode
+      run: sudo xcode-select -s /Applications/Xcode.app
+
+    - name: Cache Derived Data
+      uses: actions/cache@v3
+      with:
+        path: ~/Library/Developer/Xcode/DerivedData
+        key: ${{ runner.os }}-xcode-deriveddata-${{ github.sha }}
+        restore-keys: |
+          ${{ runner.os }}-xcode-deriveddata-
 
     - name: Run build
       run: |
         xcodebuild \
           -scheme com.awareframework.ios.core \
           -sdk iphonesimulator \
-          -destination 'platform=iOS Simulator,name=iPhone 16,OS=18.0' \
+          -destination 'platform=iOS Simulator,name=iPhone 14,OS=16.4' \
           build | xcpretty
 
     - name: Run tests
       run: |
         xcodebuild \
           -scheme com.awareframework.ios.core \
-          -destination 'platform=iOS Simulator,name=iPhone 16,OS=18.0' \
+          -destination 'platform=iOS Simulator,name=iPhone 14,OS=16.4' \
           -sdk iphonesimulator \
           -configuration Debug \
+          -enableCodeCoverage YES \
           clean test | xcpretty

@@ -14,33 +14,14 @@ open class SensorConfig{
     public var label:String = ""
     public var deviceId:String = AwareUtils.getCommonDeviceId()
     public var dbEncryptionKey:String? = nil
-    public var dbType:DatabaseType = .NONE
+    public var dbType:DatabaseType = .sqlite
+    public var serverType:ServerType = .aware_micro
     public var dbPath:String = "aware"
     public var dbHost:String? = nil
     
     public var dbTableName:String? = nil
     
-    public convenience init(dbType:DatabaseType = .NONE,
-                deviceId:String? = nil,
-                dbPath:String? = nil,
-                enabled:Bool = false,
-                debug:Bool = false,
-                label:String? = nil,
-                dbEncryptionKey:String? = nil,
-                dbHost:String? = nil,
-                dbTableName:String){
-        self.init()
-        self.deviceId = deviceId ?? AwareUtils.getCommonDeviceId()
-        self.dbPath = dbPath ?? "aware"
-        self.enabled = enabled
-        self.debug = debug
-        self.dbType = dbType
-        self.label = label ?? ""
-        self.dbEncryptionKey = dbEncryptionKey
-        self.dbHost = dbHost
-        self.dbTableName = dbTableName
-
-    }
+    public init(){}
     
     public convenience init(_ config:Dictionary<String,Any>){
         self.init()
@@ -68,9 +49,9 @@ open class SensorConfig{
 
         if let dbType = config["dbType"] as? Int {
             if dbType == 0 {
-                self.dbType = DatabaseType.NONE
+                self.dbType = .none
             }else if dbType == 1 {
-                self.dbType = DatabaseType.SQLite
+                self.dbType = .sqlite
             }
         }
         
