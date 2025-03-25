@@ -16,7 +16,7 @@ You can integrate this framework into your project via Swift Package Manager (Sw
     * Open `Xcode` -> Select `Menu Bar` -> `File` -> `App Package Dependencies...` 
 
 2. Find the package using the manager
-    * Select `Search Package URL` and type `git@github.com:awareframework/com.awareframework.ios.core.git`
+    * Select `Search Package URL` and type `https://github.com/awareframework/com.awareframework.ios.core.git`
 
 3. Import the package into your target.
 
