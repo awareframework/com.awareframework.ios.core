@@ -1,4 +1,4 @@
-// swift-tools-version: 5.10.0
+// swift-tools-version: 6.0
 // The swift-tools-version declares the minimum version of Swift required to build this package.
 
 import PackageDescription
@@ -14,7 +14,7 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/SwiftyJSON/SwiftyJSON.git", from: "5.0.2"),
-        .package(url: "https://github.com/groue/GRDB.swift.git", .upToNextMinor(from: "7.3.0")),
+        .package(url: "https://github.com/groue/GRDB.swift.git", from: "7.3.0"),
         .package(url: "https://github.com/ashleymills/Reachability.swift.git", from: "5.2.4")
     ],
     targets: [
@@ -30,5 +30,6 @@ let package = Package(
             name: "com.awareframework.ios.coreTests",
             dependencies: ["com.awareframework.ios.core"]
         )
-    ]
+    ],
+    swiftLanguageModes: [.v5]
 )
