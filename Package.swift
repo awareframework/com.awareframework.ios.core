@@ -22,11 +22,11 @@ let package = Package(
             dependencies: [
                 .product(name: "SwiftyJSON", package: "SwiftyJSON"),
                 .product(name: "GRDB", package: "GRDB.swift")
-            ]),
+            ]
+        ),
         .testTarget(
             name: "com.awareframework.ios.coreTests",
             dependencies: ["com.awareframework.ios.core"]
-        ),
-    ],
-    swiftLanguageModes: [.v5]
+        )
+    ]
 )
