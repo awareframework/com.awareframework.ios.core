@@ -7,7 +7,10 @@
 
 import Foundation
 import UIKit
+
+#if canImport(Reachability) && os(iOS)
 import Reachability
+#endif
 
 open class DbSyncManager {
     
@@ -127,20 +130,24 @@ open class DbSyncManager {
     @objc public func sync(_ force:Bool=false){
         
         if CONFIG.batteryChargingOnly && force == false {
-            switch UIDevice.current.batteryState {
-            case .unknown,.unplugged:
-                return
-            default:
-                break
-            }
+            #if canImport(Reachability) && os(iOS)
+                switch UIDevice.current.batteryState {
+                case .unknown,.unplugged:
+                    return
+                default:
+                    break
+                }
+            #endif
         }
         
         if CONFIG.wifiOnly && force == false {
             do {
-                let reachability = try Reachability()
-                if reachability.connection == .cellular || reachability.connection == .unavailable {
-                    return
-                }
+                #if canImport(Reachability) && os(iOS)
+                    let reachability = try Reachability()
+                    if reachability.connection == .cellular || reachability.connection == .unavailable {
+                        return
+                    }
+                #endif
             }catch {
                 print(error)
                 return

@@ -18,7 +18,7 @@ public protocol ISensorController {
     func set(label:String)
 }
 
-open class AwareSensor: NSObject,ISensorController {
+open class AwareSensor: NSObject, ISensorController {
 
     public let notificationCenter = NotificationCenter.default
     public var syncState  = false

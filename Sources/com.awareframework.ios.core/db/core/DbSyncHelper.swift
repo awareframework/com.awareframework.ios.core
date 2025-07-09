@@ -192,7 +192,6 @@ open class DbSyncHelper: NSObject, URLSessionDelegate, URLSessionDataDelegate, U
                 self.urlSession(session, task: task, didCompleteWithError: nil)
             }
         }
-    
     }
     
     //////////
