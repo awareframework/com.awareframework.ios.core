@@ -56,7 +56,7 @@ open class SQLiteEngine: Engine {
                 let instance = self.getSQLiteInstance()
                 try instance?.write{ db in
                     for d in data {
-                        if let result = handler(d) as? PersistableRecord {
+                        if let result = handler(d) as? (any PersistableRecord) {
                             try result.insert(db)
                         }
                     }
@@ -69,7 +69,7 @@ open class SQLiteEngine: Engine {
         }
     }
     
-    open func save(_ data: Array<BaseDbModelSQLite>, completion:((Error?)->Void)?){
+    open func save(_ data: Array<any BaseDbModelSQLite>, completion:((Error?)->Void)?){
         do {
             let instance = self.getSQLiteInstance()
             try instance?.write{ db in
@@ -199,6 +199,26 @@ open class SQLiteEngine: Engine {
 
     }
     
+    
+    func getAllTableNames(in dbQueue: DatabaseQueue) throws -> [String] {
+        return try dbQueue.read { db in
+            try String.fetchAll(db, sql: """
+                SELECT name FROM sqlite_master 
+                WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                ORDER BY name
+            """)
+        }
+    }
+    
+    func hasTable(_ tableName:String, in dbQueue: DatabaseQueue) throws  -> Bool{
+        let tables = try getAllTableNames(in: dbQueue)
+        return tables.contains { element in
+            if element == tableName {
+                return true
+            }
+            return false
+        }
+    }
 
 }
 

@@ -6,7 +6,11 @@
 //
 
 import Foundation
+#if os(iOS)
 import UIKit
+#elseif os(watchOS)
+import WatchKit
+#endif
 
 public class AwareUtils{
 
@@ -21,7 +25,13 @@ public class AwareUtils{
         if let deviceId = UserDefaults.standard.string(forKey: kDeviceIdKey) {
             return deviceId
         }else{
+            
+            #if os(watchOS)
+            let deviceId =  WKInterfaceDevice.current().identifierForVendor?.uuidString
+            #else
             let deviceId = UIDevice.current.identifierForVendor?.uuidString
+            #endif
+                        
             if let did = deviceId {
                 UserDefaults.standard.set(did, forKey: kDeviceIdKey)
                 return did

@@ -22,6 +22,6 @@ public protocol BaseDbModelSQLite: Codable, FetchableRecord, PersistableRecord {
     
     func toDictionary() -> Dictionary<String, Any>
     
-    static func createTable(queue: DatabaseQueue)
+    static func createTable(queue: DatabaseQueue) throws
     static var databaseTableName: String  { get }
 }
