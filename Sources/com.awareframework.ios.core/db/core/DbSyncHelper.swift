@@ -785,6 +785,9 @@ open class DbSyncHelper: NSObject {
                 // Create and execute data task
                 let task = session.dataTask(with: request)
                 
+                // Add task description for better debugging
+                task.taskDescription = "Upload[\(tableName)]_Batch[\(candidates.count)]_LastID[\(idOfLastCandidate ?? 0)]"
+                
                 if !self.config.test {
                     // Send actual HTTP request
                     task.resume()
@@ -947,9 +950,13 @@ open class DbSyncHelper: NSObject {
                 completionHandler(URLSession.ResponseDisposition.allow);
             }else{
                 // Other status codes are processed as error and stopped
+                logWarning("HTTP error response: \(httpResponse.statusCode) from \(httpResponse.url?.absoluteString ?? "unknown URL")")
                 completionHandler(URLSession.ResponseDisposition.cancel);
                 logVerbose("Response: \(response)")
             }
+        } else {
+            // Non-HTTP response, allow to continue
+            completionHandler(URLSession.ResponseDisposition.allow);
         }
     }
     
@@ -985,7 +992,7 @@ open class DbSyncHelper: NSObject {
      * @param error Task error (if any)
      */
     open func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        let responseState = evaluateResponseState(error: error)
+        let responseState = evaluateResponseState(error: error, task: task, session: session)
         
         // Debug output of server response
         if self.config.debug {
@@ -1033,12 +1040,55 @@ open class DbSyncHelper: NSObject {
      * Evaluate response state
      * 
      * @param error Network error (if any)
+     * @param task URLSessionTask instance
+     * @param session URLSession instance
      * @return Whether the response is successful
      */
-    private func evaluateResponseState(error: Error?) -> Bool {
+    private func evaluateResponseState(error: Error?, task: URLSessionTask? = nil, session: URLSession? = nil) -> Bool {
         if let unwrappedError = error {
-            // In case of network error or HTTP error
-            logError("failed: \(unwrappedError)")
+            // Build session context information
+            var sessionInfo = ""
+            if let sessionId = session?.configuration.identifier {
+                sessionInfo += "SessionID: \(sessionId)"
+            }
+            if let taskId = task?.taskIdentifier {
+                sessionInfo += sessionInfo.isEmpty ? "TaskID: \(taskId)" : ", TaskID: \(taskId)"
+            }
+            if let taskDescription = task?.taskDescription {
+                sessionInfo += ", TaskDesc: \(taskDescription)"
+            }
+            let sessionContext = sessionInfo.isEmpty ? "" : " [\(sessionInfo)]"
+            
+            // Handle specific error types with simplified messages
+            let nsError = unwrappedError as NSError
+            
+            if nsError.domain == NSURLErrorDomain {
+                switch nsError.code {
+                case NSURLErrorCancelled:
+                    logWarning("Request was cancelled - Check server response status or network interruption\(sessionContext)")
+                case NSURLErrorTimedOut:
+                    logError("Request timed out - Server may be overloaded or network is slow\(sessionContext)")
+                case NSURLErrorNetworkConnectionLost:
+                    logError("Network connection lost - Check WiFi/cellular connectivity\(sessionContext)")
+                case NSURLErrorNotConnectedToInternet:
+                    logError("No internet connection - Verify network settings and connectivity\(sessionContext)")
+                case NSURLErrorCannotFindHost:
+                    logError("Cannot find host - Verify server URL: \(host)\(sessionContext)")
+                case NSURLErrorCannotConnectToHost:
+                    logError("Cannot connect to host - Server may be down or unreachable\(sessionContext)")
+                case NSURLErrorBadURL:
+                    logError("Invalid URL format - Check endpoint configuration\(sessionContext)")
+                case NSURLErrorHTTPTooManyRedirects:
+                    logError("Too many redirects - Server configuration issue\(sessionContext)")
+                case NSURLErrorSecureConnectionFailed:
+                    logError("SSL/TLS connection failed - Check certificate validity\(sessionContext)")
+                default:
+                    logError("Network error (code: \(nsError.code)) - \(nsError.localizedDescription)\(sessionContext)")
+                }
+            } else {
+                logError("Upload failed: \(unwrappedError.localizedDescription)\(sessionContext)")
+            }
+            
             return false
         }
         
