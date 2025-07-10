@@ -84,6 +84,40 @@ open class SQLiteEngine: Engine {
             print(error)
         }
     }
+    
+    public override func count(filter: String?) -> Int {
+        let instance = self.getSQLiteInstance()
+        if let tableName = self.config.tableName {
+            do {
+                let queryResult = try instance?.read { db in
+                    var sql = "SELECT count(*) as count FROM \(tableName)"
+                    if let f = filter {
+                        sql = "\(sql) where \(f)"
+                    }
+                    let cursor = try Row.fetchCursor(db, sql: sql)
+                    
+                    // convert Row to Dict
+                    var result: [String: Any] = [:]
+                    while let row = try cursor.next() {
+                        var dict: [String: Any] = [:]
+                        for column in row.columnNames {
+                            dict[column] = row[column]
+                        }
+                        result = dict
+                        break
+                    }
+                    // return the number of candidates
+                    return result["count"] ?? 0
+                }
+                if let c = queryResult {
+                    return Int(c as! Int64)
+                }
+            }catch {
+                print(error)
+            }
+        }
+        return 0
+    }
 
 
     public override func fetch(filter: String?=nil, limit:Int?=nil) -> Array<Dictionary<String,Any>>? {
@@ -172,6 +206,7 @@ open class SQLiteEngine: Engine {
         if let uwHost = self.config.host,
            let tableName = self.config.tableName {
             self.syncHelper?.stop()
+                
             self.syncHelper = DbSyncHelper.init(engine: self,
                                                     host:   uwHost,
                                                     tableName:  tableName,
@@ -184,6 +219,7 @@ open class SQLiteEngine: Engine {
             }else{
                 self.syncHelper?.run(completion: syncConfig.completionHandler)
             }
+            
         }else{
             print("[Error][\(self.config.tableName ?? "table name is empty")] 'Host Name' or 'Object Type' is nil. Please check the parapmeters.")
         }

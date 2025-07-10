@@ -29,10 +29,35 @@
 //  Created by Yuuki Nishiyama on 2018/10/18.
 //
 
+import Foundation
+#if canImport(UIKit)
 import UIKit
+#endif
 
 public typealias DbSyncCompletionHandler = (_ status:Bool, _ error:Error?) -> Void
 public typealias DbSyncProgressHandler = (_ progress:Double, _ error:Error?) -> Void
+
+/// Debug level for synchronization logging
+public enum DbSyncDebugLevel: Int, CaseIterable {
+    case none = 0      // No debug output
+    case error = 1     // Only errors and critical messages
+    case warning = 2   // Errors, warnings, and important status
+    case info = 3      // Basic flow information
+    case verbose = 4   // Detailed method flow and data
+    case trace = 5     // All debug information including internal details
+    
+    /// Human readable description
+    public var description: String {
+        switch self {
+        case .none: return "None"
+        case .error: return "Error"
+        case .warning: return "Warning"
+        case .info: return "Info"
+        case .verbose: return "Verbose"
+        case .trace: return "Trace"
+        }
+    }
+}
 
 public class DbSyncConfig {
     
@@ -43,6 +68,7 @@ public class DbSyncConfig {
     public var keepLastData:Bool    = false
     public var deviceId:String?     = nil
     public var debug:Bool           = false
+    public var debugLevel:DbSyncDebugLevel = .info  // Default to info level
     public var completionHandler:DbSyncCompletionHandler? = nil
     public var progressHandler:DbSyncProgressHandler? = nil
     public var dispatchQueue:DispatchQueue? = nil
@@ -85,6 +111,22 @@ public class DbSyncConfig {
         
         if let debug = config["debug"] as? Bool {
             self.debug = debug
+        }
+        
+        if let debugLevel = config["debugLevel"] as? Int {
+            if let level = DbSyncDebugLevel(rawValue: debugLevel) {
+                self.debugLevel = level
+            }
+        } else if let debugLevelString = config["debugLevel"] as? String {
+            switch debugLevelString.lowercased() {
+            case "none", "0": self.debugLevel = .none
+            case "error", "1": self.debugLevel = .error
+            case "warning", "2": self.debugLevel = .warning
+            case "info", "3": self.debugLevel = .info
+            case "verbose", "4": self.debugLevel = .verbose
+            case "trace", "5": self.debugLevel = .trace
+            default: break
+            }
         }
         
         if let test = config["test"] as? Bool {

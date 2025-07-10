@@ -36,6 +36,8 @@ public protocol EngineProtocal {
     
     func fetch(filter:String?, limit:Int?) -> Array<Dictionary<String,Any>>?
     func fetch(filter:String?, limit:Int?, completion:((Array<Dictionary<String,Any>>?, Error?)->Void)?)
+    
+    func count(filter:String?) -> Int
 
     func remove(filter:String?, limit: Int?)
     func remove(filter:String?, limit: Int?, completion:((Error?)->Void)?)
@@ -50,6 +52,7 @@ public protocol EngineProtocal {
 }
 
 open class Engine: EngineProtocal {
+
 
     open var dictToModelHandler:DictToModelHandler?
     open var modelToDictHandler:ModelToDictHandler?
@@ -132,6 +135,9 @@ open class Engine: EngineProtocal {
         // print("Please orverwrite -save(objects)")
     }
     
+    public func count(filter: String?) -> Int {
+        return 0
+    }
     
     public func fetch(filter: String?, limit: Int?) -> Array<Dictionary<String,Any>>? {
         return nil

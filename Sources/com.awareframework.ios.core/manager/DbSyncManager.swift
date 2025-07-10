@@ -6,7 +6,9 @@
 //
 
 import Foundation
+#if canImport(UIKit)
 import UIKit
+#endif
 
 #if canImport(Reachability) && os(iOS)
 import Reachability
@@ -18,12 +20,32 @@ open class DbSyncManager {
     public var CONFIG:DbSyncManagerConfig
     var TAG:String = "com.aware.manager.sync"
     
+    // MARK: - Debug Logging Helpers
+    private func log(_ message: String, level: DbSyncDebugLevel = .info) {
+        if CONFIG.debugLevel.rawValue >= level.rawValue {
+            print("[\(TAG)][\(level.description)] \(message)")
+        }
+    }
+    
+    private func logError(_ message: String) {
+        log(message, level: .error)
+    }
+    
+    private func logWarning(_ message: String) {
+        log(message, level: .warning)
+    }
+    
+    private func logInfo(_ message: String) {
+        log(message, level: .info)
+    }
+    
     open class DbSyncManagerConfig{
         public init(){}
         public var syncInterval:Double      = 1.0
         public var wifiOnly:Bool            = true
         public var batteryChargingOnly:Bool = false
         public var debug:Bool               = false
+        public var debugLevel:DbSyncDebugLevel = .info  // Default to info level
         public var sensors                  = Array<AwareSensor>()
     }
     
@@ -35,7 +57,8 @@ open class DbSyncManager {
             if minutes > 0 {
                 builderConfig.syncInterval = minutes
             }else{
-                print("[Error]","[Illegal Parameter]","The interval parameter (minute) has to be more than zero.")
+                // Note: Cannot access log() from static context, use print for this validation error
+                print("[Error][DbSyncManager] Illegal Parameter: The interval parameter (minute) has to be more than zero.")
             }
             return self
         }
@@ -149,7 +172,7 @@ open class DbSyncManager {
                     }
                 #endif
             }catch {
-                print(error)
+                logError("Reachability check failed: \(error)")
                 return
             }
         }

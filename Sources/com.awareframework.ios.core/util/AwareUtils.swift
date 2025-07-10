@@ -28,8 +28,11 @@ public class AwareUtils{
             
             #if os(watchOS)
             let deviceId =  WKInterfaceDevice.current().identifierForVendor?.uuidString
-            #else
+            #elseif os(iOS)
             let deviceId = UIDevice.current.identifierForVendor?.uuidString
+            #else
+            // macOS or other platforms - use a UUID
+            let deviceId: String? = nil
             #endif
                         
             if let did = deviceId {

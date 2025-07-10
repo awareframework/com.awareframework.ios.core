@@ -5,7 +5,10 @@
 //  Created by Yuuki Nishiyama on 2018/11/23.
 //
 
+import Foundation
+#if canImport(UIKit)
 import UIKit
+#endif
 
 public class SensorManager: NSObject {
     
