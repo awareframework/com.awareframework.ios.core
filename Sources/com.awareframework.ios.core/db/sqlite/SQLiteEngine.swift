@@ -1,260 +1,172 @@
-//
-//  SQLiteEngine.swift
-//  com.awareframework.ios.core
-//
-//  Created by Yuuki Nishiyama on 2025/03/14.
-//
-
 import Foundation
-import CommonCrypto
 import GRDB
 
 open class SQLiteEngine: Engine {
 
-    var syncHelper:DbSyncHelper?
-    
+    var syncHelper: DbSyncHelper?
+
     public override init(_ config: EngineConfig) {
         super.init(config)
-        if let path = config.path {
-            let documentDirFileURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).last!
-            let fileURL = documentDirFileURL.appendingPathComponent(path+".sqlite")
-            do {
-                _ = try DatabaseQueue(path: fileURL.absoluteString)
-            } catch {
-                print(error)
-            }
-        }else{
-            print("[Error][SQLiteEngine] The database path is `nil`. SQLiteEngine could not generate RealmEngine instance.")
+        guard let path = config.path else {
+            print("[Error][SQLiteEngine] database path is nil.")
+            return
+        }
+        let fileURL = Self.fileURL(for: path)
+        do {
+            _ = try DatabaseQueue(path: fileURL.path)
+        } catch {
+            print("[Error][SQLiteEngine] Failed to open database: \(error)")
         }
     }
-    
-    
-    /// Provide a new Realm instance
-    ///
-    /// - Returns: A Realm instance
+
+    // MARK: - Database access
+
     public func getSQLiteInstance() -> DatabaseQueue? {
+        guard let path = config.path else { return nil }
         do {
-            if let path = config.path {
-                let documentDirFileURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).last!
-                let fileURL = documentDirFileURL.appendingPathComponent(path+".sqlite")
-                let dbQueue = try DatabaseQueue(path: fileURL.absoluteString)
-                return dbQueue
+            return try DatabaseQueue(path: Self.fileURL(for: path).path)
+        } catch {
+            print("[Error][SQLiteEngine] \(error)")
+            return nil
+        }
+    }
+
+    private static func fileURL(for path: String) -> URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent(path + ".sqlite")
+    }
+
+    // MARK: - Save
+
+    open override func save(_ data: [any BaseDbModelSQLite], completion: ((Error?) -> Void)?) {
+        do {
+            try getSQLiteInstance()?.write { db in
+                for record in data {
+                    try record.insert(db)
+                }
+            }
+            completion?(nil)
+        } catch {
+            print("[Error][SQLiteEngine] save failed: \(error)")
+            completion?(error)
+        }
+    }
+
+    // MARK: - Count
+
+    public override func count(filter: String?) -> Int {
+        guard let tableName = config.tableName,
+              let db = getSQLiteInstance() else { return 0 }
+        do {
+            let sql = filter.map { "SELECT count(*) as count FROM \(tableName) WHERE \($0)" }
+                         ?? "SELECT count(*) as count FROM \(tableName)"
+            return try db.read { db in
+                let row = try Row.fetchOne(db, sql: sql)
+                return (row?["count"] as? Int64).map(Int.init) ?? 0
             }
         } catch {
-            print("[Error][\(self.config.type)]",error)
-        }
-        return nil
-    }
-    
-    open override func save(_ dict: Dictionary<String, Any>, completion:((Error?)->Void)?) {
-        self.save([dict], completion: completion)
-    }
-    
-    open override func save(_ data: Array<Dictionary<String, Any>>, completion:((Error?)->Void)?){
-        if let handler = self.dictToModelHandler {
-            do {
-                let instance = self.getSQLiteInstance()
-                try instance?.write{ db in
-                    for d in data {
-                        if let result = handler(d) as? (any PersistableRecord) {
-                            try result.insert(db)
-                        }
-                    }
-                }
-            }catch {
-                print(error)
-            }
-        }else {
-            print("[Error][SQLiteEngine] `dictToModelHandler` is a required handler. Please the handler for \(config.tableName ?? "tableName")")
+            print("[Error][SQLiteEngine] count failed: \(error)")
+            return 0
         }
     }
-    
-    open func save(_ data: Array<any BaseDbModelSQLite>, completion:((Error?)->Void)?){
+
+    // MARK: - Fetch
+
+    public override func fetch(filter: String? = nil, limit: Int? = nil) -> [[String: Any]]? {
+        guard let tableName = config.tableName,
+              let db = getSQLiteInstance() else { return nil }
         do {
-            let instance = self.getSQLiteInstance()
-            try instance?.write{ db in
-                for d in data {
-                    try d.insert(db)
+            var sql = "SELECT * FROM \(tableName)"
+            if let f = filter { sql += " WHERE \(f)" }
+            if let l = limit  { sql += " LIMIT \(l)" }
+            return try db.read { db in
+                let cursor = try Row.fetchCursor(db, sql: sql)
+                var results: [[String: Any]] = []
+                while let row = try cursor.next() {
+                    var dict: [String: Any] = [:]
+                    for column in row.columnNames { dict[column] = row[column] }
+                    results.append(dict)
                 }
+                return results
             }
-            if let completion = completion {
-                completion(nil)
-            }
-        }catch {
-            print(error)
+        } catch {
+            print("[Error][SQLiteEngine] fetch failed: \(error)")
+            return nil
         }
-    }
-    
-    public override func count(filter: String?) -> Int {
-        let instance = self.getSQLiteInstance()
-        if let tableName = self.config.tableName {
-            do {
-                let queryResult = try instance?.read { db in
-                    var sql = "SELECT count(*) as count FROM \(tableName)"
-                    if let f = filter {
-                        sql = "\(sql) where \(f)"
-                    }
-                    let cursor = try Row.fetchCursor(db, sql: sql)
-                    
-                    // convert Row to Dict
-                    var result: [String: Any] = [:]
-                    while let row = try cursor.next() {
-                        var dict: [String: Any] = [:]
-                        for column in row.columnNames {
-                            dict[column] = row[column]
-                        }
-                        result = dict
-                        break
-                    }
-                    // return the number of candidates
-                    return result["count"] ?? 0
-                }
-                if let c = queryResult {
-                    return Int(c as! Int64)
-                }
-            }catch {
-                print(error)
-            }
-        }
-        return 0
     }
 
+    public override func fetch(filter: String? = nil, limit: Int? = nil,
+                               completion: (([[String: Any]]?, Error?) -> Void)?) {
+        completion?(fetch(filter: filter, limit: limit), nil)
+    }
 
-    public override func fetch(filter: String?=nil, limit:Int?=nil) -> Array<Dictionary<String,Any>>? {
-        let instance = self.getSQLiteInstance()
-        if let tableName = self.config.tableName {
-            do {
-                let queryResult = try instance?.read { db in
-                    var sql = "SELECT * FROM \(tableName)"
-                    if let f = filter {
-                        sql = "\(sql) where \(f)"
-                    }
-                    if let l = limit {
-                        sql = "\(sql) limit \(l)"
-                    }
-                    
-                    let cursor = try Row.fetchCursor(db, sql: sql)
-                    
-                    // convert Row to Dict
-                    var results: [[String: Any]] = []
-                    while let row = try cursor.next() {
-                        var dict: [String: Any] = [:]
-                        for column in row.columnNames {
-                            dict[column] = row[column]
-                        }
-                        results.append(dict)
-                    }
-                    
-                    return results
-                }
-                return queryResult
-            }catch {
-                print(error)
+    // MARK: - Remove
+
+    open override func removeAll(completion: ((Error?) -> Void)?) {
+        guard let tableName = config.tableName else { return }
+        do {
+            try getSQLiteInstance()?.write { db in
+                try db.execute(sql: "DELETE FROM \(tableName)")
             }
-        }
-        return nil
-    }
-    
-    public override func fetch(filter: String?=nil, limit:Int?=nil,
-                               completion: ((Array<Dictionary<String,Any>>?, Error?) -> Void)?) {
-        if let completion = completion {
-            let result = fetch(filter: filter, limit: limit)
-            completion(result, nil)
+            completion?(nil)
+        } catch {
+            print("[Error][SQLiteEngine] removeAll failed: \(error)")
+            completion?(error)
         }
     }
-    
-    
-    open override func removeAll(completion:((Error?)->Void)?){
-        let instance = self.getSQLiteInstance()
-        if let tableName = self.config.tableName {
-            do {
-                try instance?.write({ db in
-                    try db.execute(sql: "delete from \(tableName)")
-                })
-            }catch {
-                print(error)
+
+    open override func remove(filter: String? = nil, limit: Int? = nil, completion: ((Error?) -> Void)?) {
+        guard let tableName = config.tableName else { return }
+        do {
+            try getSQLiteInstance()?.write { db in
+                var sql = "DELETE FROM \(tableName)"
+                if let f = filter { sql += " WHERE \(f)" }
+                if let l = limit  { sql += " LIMIT \(l)" }
+                try db.execute(sql: sql)
             }
+            completion?(nil)
+        } catch {
+            print("[Error][SQLiteEngine] remove failed: \(error)")
+            completion?(error)
         }
     }
-    
-    open override func remove(filter: String?=nil, limit:Int?=nil, completion:((Error?)->Void)?){
-        let instance = self.getSQLiteInstance()
-        if let tableName = self.config.tableName {
-            do {
-                try instance?.write({ db in
-                    var sql = "delete from \(tableName)"
-                    if let f = filter {
-                        sql = "\(sql) where \(f)"
-                    }
-                    if let l = limit {
-                        sql = "\(sql) limit \(l)"
-                    }
-                    try db.execute(sql: sql)
-                    
-                    if let uwCompletion = completion {
-                        uwCompletion(nil)
-                    }
-                })
-            }catch {
-                print(error)
-            }
-        }
-       
-    }
-    
+
+    // MARK: - Sync
+
     open override func startSync(_ syncConfig: DbSyncConfig) {
-        if let uwHost = self.config.host,
-           let tableName = self.config.tableName {
-            self.syncHelper?.stop()
-                
-            self.syncHelper = DbSyncHelper.init(engine: self,
-                                                    host:   uwHost,
-                                                    tableName:  tableName,
-                                                    config: syncConfig)
-            
-            if let queue = syncConfig.dispatchQueue {
-                queue.async {
-                    self.syncHelper?.run(completion: syncConfig.completionHandler)
-                }
-            }else{
-                self.syncHelper?.run(completion: syncConfig.completionHandler)
-            }
-            
-        }else{
-            print("[Error][\(self.config.tableName ?? "table name is empty")] 'Host Name' or 'Object Type' is nil. Please check the parapmeters.")
+        guard let host = config.host, let tableName = config.tableName else {
+            print("[Error][SQLiteEngine] host or tableName is nil.")
+            return
+        }
+        syncHelper?.stop()
+        syncHelper = DbSyncHelper(engine: self, host: host, tableName: tableName, config: syncConfig)
+        let run = { self.syncHelper?.run(completion: syncConfig.completionHandler) }
+        if let queue = syncConfig.dispatchQueue {
+            queue.async { run() }
+        } else {
+            run()
         }
     }
-    
-    open override func stopSync() {
-        // print("Please overwrite -cancelSync()")
-        self.syncHelper?.stop()
-        
-    }
-    
-    open override func close() {
 
+    open override func stopSync() {
+        syncHelper?.stop()
     }
-    
-    
-    func getAllTableNames(in dbQueue: DatabaseQueue) throws -> [String] {
-        return try dbQueue.read { db in
+
+    open override func close() {}
+
+    // MARK: - Schema utilities
+
+    func getAllTableNames(in db: DatabaseQueue) throws -> [String] {
+        try db.read { db in
             try String.fetchAll(db, sql: """
-                SELECT name FROM sqlite_master 
+                SELECT name FROM sqlite_master
                 WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
                 ORDER BY name
             """)
         }
     }
-    
-    func hasTable(_ tableName:String, in dbQueue: DatabaseQueue) throws  -> Bool{
-        let tables = try getAllTableNames(in: dbQueue)
-        return tables.contains { element in
-            if element == tableName {
-                return true
-            }
-            return false
-        }
+
+    func hasTable(_ tableName: String, in db: DatabaseQueue) throws -> Bool {
+        try getAllTableNames(in: db).contains(tableName)
     }
-
 }
-
