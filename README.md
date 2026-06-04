@@ -1,12 +1,17 @@
-# AWARE: Core 
+# AWARE: Core
 
 [![Swift Package Manager compatible](https://img.shields.io/badge/Swift%20Package%20Manager-compatible-brightgreen.svg)](https://github.com/apple/swift-package-manager)
 
 ## Overview
-com.awareframework.ios.sensor.core provides a basic class for developing your own sensor module on aware framework.
+`com.awareframework.ios.core` provides the foundational classes and utilities for building sensor modules on the AWARE framework for iOS/watchOS. It includes:
+
+- Base sensor class (`AwareSensor`) and configuration model
+- SQLite-backed storage engine (via GRDB) with connection pooling, WAL mode, and retry logic
+- Database sync helper for uploading sensor data to a remote host
+- Sensor and database manager utilities
 
 ## Requirements
-iOS 13 or later.
+iOS 13 or later. watchOS 7 or later.
 
 ## Installation
 

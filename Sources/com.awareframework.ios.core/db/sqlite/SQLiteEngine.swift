@@ -4,6 +4,9 @@ import GRDB
 open class SQLiteEngine: Engine {
 
     var syncHelper: DbSyncHelper?
+    private static var databaseQueues: [String: DatabaseQueue] = [:]
+    private static let databaseQueuesLock = NSLock()
+    private static let retryLimit = 5
 
     public override init(_ config: EngineConfig) {
         super.init(config)
@@ -13,7 +16,7 @@ open class SQLiteEngine: Engine {
         }
         let fileURL = Self.fileURL(for: path)
         do {
-            _ = try DatabaseQueue(path: fileURL.path)
+            _ = try Self.databaseQueue(for: fileURL.path)
         } catch {
             print("[Error][SQLiteEngine] Failed to open database: \(error)")
         }
@@ -24,11 +27,61 @@ open class SQLiteEngine: Engine {
     public func getSQLiteInstance() -> DatabaseQueue? {
         guard let path = config.path else { return nil }
         do {
-            return try DatabaseQueue(path: Self.fileURL(for: path).path)
+            return try Self.databaseQueue(for: Self.fileURL(for: path).path)
         } catch {
             print("[Error][SQLiteEngine] \(error)")
             return nil
         }
+    }
+
+    private static func databaseQueue(for path: String) throws -> DatabaseQueue {
+        databaseQueuesLock.lock()
+        defer { databaseQueuesLock.unlock() }
+
+        if let queue = databaseQueues[path] {
+            return queue
+        }
+
+        var configuration = Configuration()
+        configuration.busyMode = .timeout(10)
+        configuration.journalMode = .wal
+        configuration.prepareDatabase { db in
+            try db.execute(sql: "PRAGMA foreign_keys = ON")
+            try db.execute(sql: "PRAGMA synchronous = NORMAL")
+        }
+
+        let queue = try retryLockedDatabaseWork {
+            try DatabaseQueue(path: path, configuration: configuration)
+        }
+        databaseQueues[path] = queue
+        return queue
+    }
+
+    private static func retryLockedDatabaseWork<T>(_ work: () throws -> T) throws -> T {
+        var lastError: Error?
+        for attempt in 0..<retryLimit {
+            do {
+                return try work()
+            } catch {
+                lastError = error
+                guard isDatabaseLocked(error), attempt < retryLimit - 1 else {
+                    throw error
+                }
+                Thread.sleep(forTimeInterval: retryDelay(for: attempt))
+            }
+        }
+        throw lastError ?? NSError(domain: "SQLiteEngine", code: Int(ResultCode.SQLITE_BUSY.rawValue))
+    }
+
+    private static func isDatabaseLocked(_ error: Error) -> Bool {
+        guard let databaseError = error as? DatabaseError else {
+            return false
+        }
+        return databaseError.resultCode.primaryResultCode == .SQLITE_BUSY
+    }
+
+    private static func retryDelay(for attempt: Int) -> TimeInterval {
+        0.05 * Double(attempt + 1)
     }
 
     private static func fileURL(for path: String) -> URL {
@@ -40,9 +93,18 @@ open class SQLiteEngine: Engine {
 
     open override func save(_ data: [any BaseDbModelSQLite], completion: ((Error?) -> Void)?) {
         do {
-            try getSQLiteInstance()?.write { db in
-                for record in data {
-                    try record.insert(db)
+            guard let queue = getSQLiteInstance() else {
+                completion?(nil)
+                return
+            }
+            try Self.retryLockedDatabaseWork {
+                try queue.write { db in
+                    try db.execute(sql: "PRAGMA busy_timeout = 10000")
+                    try db.execute(sql: "PRAGMA foreign_keys = ON")
+                    try db.execute(sql: "PRAGMA synchronous = NORMAL")
+                    for record in data {
+                        try record.insert(db)
+                    }
                 }
             }
             completion?(nil)
@@ -60,9 +122,11 @@ open class SQLiteEngine: Engine {
         do {
             let sql = filter.map { "SELECT count(*) as count FROM \(tableName) WHERE \($0)" }
                          ?? "SELECT count(*) as count FROM \(tableName)"
-            return try db.read { db in
-                let row = try Row.fetchOne(db, sql: sql)
-                return (row?["count"] as? Int64).map(Int.init) ?? 0
+            return try Self.retryLockedDatabaseWork {
+                try db.read { db in
+                    let row = try Row.fetchOne(db, sql: sql)
+                    return (row?["count"] as? Int64).map(Int.init) ?? 0
+                }
             }
         } catch {
             print("[Error][SQLiteEngine] count failed: \(error)")
@@ -79,15 +143,17 @@ open class SQLiteEngine: Engine {
             var sql = "SELECT * FROM \(tableName)"
             if let f = filter { sql += " WHERE \(f)" }
             if let l = limit  { sql += " LIMIT \(l)" }
-            return try db.read { db in
-                let cursor = try Row.fetchCursor(db, sql: sql)
-                var results: [[String: Any]] = []
-                while let row = try cursor.next() {
-                    var dict: [String: Any] = [:]
-                    for column in row.columnNames { dict[column] = row[column] }
-                    results.append(dict)
+            return try Self.retryLockedDatabaseWork {
+                try db.read { db in
+                    let cursor = try Row.fetchCursor(db, sql: sql)
+                    var results: [[String: Any]] = []
+                    while let row = try cursor.next() {
+                        var dict: [String: Any] = [:]
+                        for column in row.columnNames { dict[column] = row[column] }
+                        results.append(dict)
+                    }
+                    return results
                 }
-                return results
             }
         } catch {
             print("[Error][SQLiteEngine] fetch failed: \(error)")
@@ -105,8 +171,15 @@ open class SQLiteEngine: Engine {
     open override func removeAll(completion: ((Error?) -> Void)?) {
         guard let tableName = config.tableName else { return }
         do {
-            try getSQLiteInstance()?.write { db in
-                try db.execute(sql: "DELETE FROM \(tableName)")
+            guard let queue = getSQLiteInstance() else {
+                completion?(nil)
+                return
+            }
+            try Self.retryLockedDatabaseWork {
+                try queue.write { db in
+                    try db.execute(sql: "PRAGMA busy_timeout = 10000")
+                    try db.execute(sql: "DELETE FROM \(tableName)")
+                }
             }
             completion?(nil)
         } catch {
@@ -118,11 +191,18 @@ open class SQLiteEngine: Engine {
     open override func remove(filter: String? = nil, limit: Int? = nil, completion: ((Error?) -> Void)?) {
         guard let tableName = config.tableName else { return }
         do {
-            try getSQLiteInstance()?.write { db in
-                var sql = "DELETE FROM \(tableName)"
-                if let f = filter { sql += " WHERE \(f)" }
-                if let l = limit  { sql += " LIMIT \(l)" }
-                try db.execute(sql: sql)
+            guard let queue = getSQLiteInstance() else {
+                completion?(nil)
+                return
+            }
+            try Self.retryLockedDatabaseWork {
+                try queue.write { db in
+                    try db.execute(sql: "PRAGMA busy_timeout = 10000")
+                    var sql = "DELETE FROM \(tableName)"
+                    if let f = filter { sql += " WHERE \(f)" }
+                    if let l = limit  { sql += " LIMIT \(l)" }
+                    try db.execute(sql: sql)
+                }
             }
             completion?(nil)
         } catch {

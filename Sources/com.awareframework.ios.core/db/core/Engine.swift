@@ -100,11 +100,11 @@ open class Engine: EngineProtocal {
 
     open func save(_ data: [any BaseDbModelSQLite], completion: ((Error?) -> Void)?) {}
 
-    public func count(filter: String?) -> Int { 0 }
+    open func count(filter: String?) -> Int { 0 }
 
-    public func fetch(filter: String?, limit: Int?) -> [[String: Any]]? { nil }
+    open func fetch(filter: String?, limit: Int?) -> [[String: Any]]? { nil }
 
-    public func fetch(filter: String?, limit: Int?, completion: (([[String: Any]]?, Error?) -> Void)?) {}
+    open func fetch(filter: String?, limit: Int?, completion: (([[String: Any]]?, Error?) -> Void)?) {}
 
     public func remove(filter: String?, limit: Int?) {
         self.remove(filter: filter, limit: limit, completion: nil)

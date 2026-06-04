@@ -153,34 +153,24 @@ class UnitTests: XCTestCase {
         
         
         print("Setup SQLite Engine Converters:", dbType)
-        engine.dictToModelHandler = { (data:Dictionary<String, Any>) -> Any in
-            let obj = self.getSmapleData()
-            return obj
-        }
-        engine.modelToDictHandler = {(data: Any) -> Dictionary<String, Any> in
-            if let d = data as? A {
-                return d.toDictionary()
-            }
-            return Dictionary()
-        }
         print("Create a table in SQLite")
         if let e = engine as? SQLiteEngine {
             if let q = e.getSQLiteInstance() {
-                A.createTable(queue: q)
+                try? A.createTable(queue: q)
             }
         }
-        
-        engine.save(self.getSmapleData().toDictionary())
+
+        engine.save([self.getSmapleData()] as [any BaseDbModelSQLite])
         let results = engine.fetch(filter: nil, limit: nil)
         XCTAssertEqual((results ?? []).count, 1)
-        
-        
-        var dicts:Array<Dictionary<String, Any>> = []
+
+
+        var models: [any BaseDbModelSQLite] = []
         for i in 0..<100 {
             print(i)
-            dicts.append(self.getSmapleData().toDictionary())
+            models.append(self.getSmapleData())
         }
-        engine.save(dicts)
+        engine.save(models)
         
         let results2 = engine.fetch(filter: nil, limit: nil)
         XCTAssertEqual((results2 ?? []).count, 101)
@@ -287,21 +277,11 @@ class UnitTests: XCTestCase {
         A.createTable(queue: query)
         
         if let engine = sensor.dbEngine {
-            engine.dictToModelHandler = {dict in
-                let model = A(dict)
-                return model
-            }
-            
-            engine.modelToDictHandler = {data in
-                return (data as! A).toDictionary()
-            }
-            
-            var data:Array<Dictionary<String, Any>> = []
+            var data: [any BaseDbModelSQLite] = []
             for _ in 0..<24 {
-                data.append(getSmapleData().toDictionary())
+                data.append(getSmapleData())
             }
             engine.save(data)
-
         }
         
         let expectation = XCTestExpectation.init(description: "sync task")
@@ -481,23 +461,6 @@ class SensorTests: XCTestCase {
             }
         }
         
-        sensor.dbEngine?.dictToModelHandler = { dict in
-            if sensor.CONFIG.dbType == .sqlite {
-                let model = AccelerometerDbModelSQLite(dict)
-                return model
-            }
-            return []
-        }
-        
-        sensor.dbEngine?.modelToDictHandler = {model in
-            if let model = model as? AccelerometerDbModelSQLite {
-                return model.toDictionary()
-            }
-            
-            return Dictionary<String, Any>()
-            
-        }
-        
         sensor.start()
         
         let dbExpect = XCTestExpectation.init(description: "sensing test")
@@ -544,7 +507,7 @@ class AccelerometerSensor:AwareSensor {
     
     ////////////////////////////////////
     var timer:Timer?
-    var dataBuffer  = Array<Dictionary<String, Any>>()
+    var dataBuffer = Array<AccelerometerDbModelSQLite>()
     
     public class Config:SensorConfig{
         public var frequency:Int    = 5 // Hz
@@ -607,19 +570,11 @@ class AccelerometerSensor:AwareSensor {
                            repeats: true, block: { (timer) in
             // Get the accelerometer data.
            
-            let x = 1
-            let y = 2
-            let z = 3
-            
-            let currentTime:Double = Date().timeIntervalSince1970
-            
-            let data = [
-                "timestamp":Int64(currentTime*1000),
-                "x":x,
-                "y":y,
-                "z":z,
-            ]
-            
+            let x = 1.0
+            let y = 2.0
+            let z = 3.0
+
+            let data = AccelerometerDbModelSQLite(x: x, y: y, z: z)
             self.dataBuffer.append(data)
             ////////////////////////////////////////
             ///
@@ -627,7 +582,7 @@ class AccelerometerSensor:AwareSensor {
                 return
             }
             
-            let dataArray = Array(self.dataBuffer)
+            let dataArray: [any BaseDbModelSQLite] = Array(self.dataBuffer)
             OperationQueue().addOperation({ () -> Void in
                 self.dbEngine?.save(dataArray){ error in
                     if error != nil {

@@ -15,15 +15,18 @@ class DbSyncHelperIntegrationTests: XCTestCase {
     
     var syncHelper: DbSyncHelper!
     var mockEngine: MockEngine!
-    var mockConfig: MockDbSyncConfig!
-    
+    var mockConfig: DbSyncConfig!
+
     override func setUp() {
         super.setUp()
-        
+        DbSyncUtils.clearLastUploadedId(for: "sensor_data")
+
         mockEngine = MockEngine()
-        mockConfig = MockDbSyncConfig()
-        mockConfig.test = true // Ensure test mode is enabled
-        
+        mockConfig = DbSyncConfig()
+        mockConfig.test = true
+        mockConfig.debug = true
+        mockConfig.backgroundSession = false
+
         syncHelper = DbSyncHelper(
             engine: mockEngine,
             host: "https://api.test.com",
@@ -82,7 +85,7 @@ class DbSyncHelperIntegrationTests: XCTestCase {
         let expectation = XCTestExpectation(description: "Incremental sync")
         
         // Simulate that some data was already synced
-        DbSyncUtils.setLastUploadedId(50, "sensor_data")
+        DbSyncUtils.setLastUploadedId(50, for: "sensor_data")
         
         // Create data with IDs 1-100
         mockEngine.mockData = Array(1...100).map { i in
@@ -100,7 +103,7 @@ class DbSyncHelperIntegrationTests: XCTestCase {
         syncHelper.run { success, error in
             XCTAssertTrue(success)
             // Verify that the last uploaded ID was updated
-            let lastId = DbSyncUtils.getLastUploadedId("sensor_data")
+            let lastId = DbSyncUtils.getLastUploadedId(for: "sensor_data")
             XCTAssertEqual(lastId, 100)
             expectation.fulfill()
         }
@@ -168,7 +171,7 @@ class DbSyncHelperIntegrationTests: XCTestCase {
         
         autoreleasepool {
             let tempEngine = MockEngine()
-            let tempConfig = MockDbSyncConfig()
+            let tempConfig = DbSyncConfig()
             let tempSyncHelper = DbSyncHelper(
                 engine: tempEngine,
                 host: "https://test.com",
