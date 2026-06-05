@@ -47,11 +47,15 @@ open class SQLiteEngine: Engine {
         configuration.journalMode = .wal
         configuration.prepareDatabase { db in
             try db.execute(sql: "PRAGMA foreign_keys = ON")
-            try db.execute(sql: "PRAGMA synchronous = NORMAL")
         }
 
         let queue = try retryLockedDatabaseWork {
             try DatabaseQueue(path: path, configuration: configuration)
+        }
+        try retryLockedDatabaseWork {
+            try queue.writeWithoutTransaction { db in
+                try db.execute(sql: "PRAGMA synchronous = NORMAL")
+            }
         }
         databaseQueues[path] = queue
         return queue
@@ -70,7 +74,8 @@ open class SQLiteEngine: Engine {
                 Thread.sleep(forTimeInterval: retryDelay(for: attempt))
             }
         }
-        throw lastError ?? NSError(domain: "SQLiteEngine", code: Int(ResultCode.SQLITE_BUSY.rawValue))
+        throw lastError
+            ?? NSError(domain: "SQLiteEngine", code: Int(ResultCode.SQLITE_BUSY.rawValue))
     }
 
     private static func isDatabaseLocked(_ error: Error) -> Bool {
@@ -101,7 +106,6 @@ open class SQLiteEngine: Engine {
                 try queue.write { db in
                     try db.execute(sql: "PRAGMA busy_timeout = 10000")
                     try db.execute(sql: "PRAGMA foreign_keys = ON")
-                    try db.execute(sql: "PRAGMA synchronous = NORMAL")
                     for record in data {
                         try record.insert(db)
                     }
@@ -118,10 +122,12 @@ open class SQLiteEngine: Engine {
 
     public override func count(filter: String?) -> Int {
         guard let tableName = config.tableName,
-              let db = getSQLiteInstance() else { return 0 }
+            let db = getSQLiteInstance()
+        else { return 0 }
         do {
-            let sql = filter.map { "SELECT count(*) as count FROM \(tableName) WHERE \($0)" }
-                         ?? "SELECT count(*) as count FROM \(tableName)"
+            let sql =
+                filter.map { "SELECT count(*) as count FROM \(tableName) WHERE \($0)" }
+                ?? "SELECT count(*) as count FROM \(tableName)"
             return try Self.retryLockedDatabaseWork {
                 try db.read { db in
                     let row = try Row.fetchOne(db, sql: sql)
@@ -138,11 +144,12 @@ open class SQLiteEngine: Engine {
 
     public override func fetch(filter: String? = nil, limit: Int? = nil) -> [[String: Any]]? {
         guard let tableName = config.tableName,
-              let db = getSQLiteInstance() else { return nil }
+            let db = getSQLiteInstance()
+        else { return nil }
         do {
             var sql = "SELECT * FROM \(tableName)"
             if let f = filter { sql += " WHERE \(f)" }
-            if let l = limit  { sql += " LIMIT \(l)" }
+            if let l = limit { sql += " LIMIT \(l)" }
             return try Self.retryLockedDatabaseWork {
                 try db.read { db in
                     let cursor = try Row.fetchCursor(db, sql: sql)
@@ -161,8 +168,10 @@ open class SQLiteEngine: Engine {
         }
     }
 
-    public override func fetch(filter: String? = nil, limit: Int? = nil,
-                               completion: (([[String: Any]]?, Error?) -> Void)?) {
+    public override func fetch(
+        filter: String? = nil, limit: Int? = nil,
+        completion: (([[String: Any]]?, Error?) -> Void)?
+    ) {
         completion?(fetch(filter: filter, limit: limit), nil)
     }
 
@@ -188,7 +197,9 @@ open class SQLiteEngine: Engine {
         }
     }
 
-    open override func remove(filter: String? = nil, limit: Int? = nil, completion: ((Error?) -> Void)?) {
+    open override func remove(
+        filter: String? = nil, limit: Int? = nil, completion: ((Error?) -> Void)?
+    ) {
         guard let tableName = config.tableName else { return }
         do {
             guard let queue = getSQLiteInstance() else {
@@ -200,7 +211,7 @@ open class SQLiteEngine: Engine {
                     try db.execute(sql: "PRAGMA busy_timeout = 10000")
                     var sql = "DELETE FROM \(tableName)"
                     if let f = filter { sql += " WHERE \(f)" }
-                    if let l = limit  { sql += " LIMIT \(l)" }
+                    if let l = limit { sql += " LIMIT \(l)" }
                     try db.execute(sql: sql)
                 }
             }
@@ -219,7 +230,8 @@ open class SQLiteEngine: Engine {
             return
         }
         syncHelper?.stop()
-        syncHelper = DbSyncHelper(engine: self, host: host, tableName: tableName, config: syncConfig)
+        syncHelper = DbSyncHelper(
+            engine: self, host: host, tableName: tableName, config: syncConfig)
         let run = { self.syncHelper?.run(completion: syncConfig.completionHandler) }
         if let queue = syncConfig.dispatchQueue {
             queue.async { run() }
@@ -238,11 +250,13 @@ open class SQLiteEngine: Engine {
 
     func getAllTableNames(in db: DatabaseQueue) throws -> [String] {
         try db.read { db in
-            try String.fetchAll(db, sql: """
-                SELECT name FROM sqlite_master
-                WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
-                ORDER BY name
-            """)
+            try String.fetchAll(
+                db,
+                sql: """
+                        SELECT name FROM sqlite_master
+                        WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                        ORDER BY name
+                    """)
         }
     }
 
