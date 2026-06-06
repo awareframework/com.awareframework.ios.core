@@ -780,21 +780,24 @@ open class DbSyncHelper: NSObject {
             
             // Build HTTP request
             if let request = buildHTTPRequest(with: requestBody) {
+                if self.config.test {
+                    // Test mode should not leave synthetic URLSession tasks behind.
+                    // A suspended task is later returned by getAllTasks() and can be
+                    // cancelled as a real network failure during the next batch.
+                    handleSuccessfulUploadCompletion()
+                    return
+                }
+
                 let session = getOrCreateURLSession()
-                
+
                 // Create and execute data task
                 let task = session.dataTask(with: request)
-                
+
                 // Add task description for better debugging
                 task.taskDescription = "Upload[\(tableName)]_Batch[\(candidates.count)]_LastID[\(idOfLastCandidate ?? 0)]"
-                
-                if !self.config.test {
-                    // Send actual HTTP request
-                    task.resume()
-                }else{
-                    // Test mode: process as success immediately
-                    self.urlSession(session, task: task, didCompleteWithError: nil)
-                }
+
+                // Send actual HTTP request
+                task.resume()
             }
         } catch {
             // Handle JSON serialization error
@@ -817,6 +820,25 @@ open class DbSyncHelper: NSObject {
                 }
             }
         }
+    }
+
+    private func handleSuccessfulUploadCompletion() {
+        if config.debug {
+            logInfo("Success: A sync task is done correctly.")
+        }
+
+        totalUploadedRecords += currentNumOfCandidates
+        if config.debug {
+            logVerbose("Updated totalUploadedRecords: \(totalUploadedRecords)")
+        }
+
+        if config.removeAfterSync {
+            removeUploadedCandidates(lastUploadedId: lastUploadedId, limit: config.batchSize)
+        }
+
+        updateLastUploadedId()
+        receivedData = Data()
+        handleUploadCompletion(responseState: true, error: nil)
     }
     
     // MARK: - URLSession Management

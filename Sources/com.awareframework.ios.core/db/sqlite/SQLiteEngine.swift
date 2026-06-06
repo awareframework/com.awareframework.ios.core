@@ -263,4 +263,75 @@ open class SQLiteEngine: Engine {
     func hasTable(_ tableName: String, in db: DatabaseQueue) throws -> Bool {
         try getAllTableNames(in: db).contains(tableName)
     }
+
+    public func getAllTableNames() throws -> [String] {
+        guard let db = getSQLiteInstance() else {
+            return []
+        }
+        return try getAllTableNames(in: db)
+    }
+
+    public func fetchTableSchema(tableName: String) throws -> [SQLiteTableColumn] {
+        guard let database = getSQLiteInstance() else {
+            return []
+        }
+        return try database.read { db in
+            let rows = try Row.fetchAll(db, sql: "PRAGMA table_info(\(tableName))")
+            return rows.compactMap { row -> SQLiteTableColumn? in
+                guard let name = row["name"] as? String,
+                    let type = row["type"] as? String
+                else {
+                    return nil
+                }
+                return SQLiteTableColumn(name: name, type: type)
+            }
+        }
+    }
+
+    public func fetchTableRows(tableName: String) throws -> [[String: Any]] {
+        guard let database = getSQLiteInstance() else {
+            return []
+        }
+        return try database.read { db in
+            let rows = try Row.fetchAll(db, sql: "SELECT * FROM \(tableName) ORDER BY id ASC")
+            return rows.map { row in
+                var dict: [String: Any] = [:]
+                for column in row.columnNames {
+                    dict[column] = row[column]
+                }
+                return dict
+            }
+        }
+    }
+
+    public func fetchTableSnapshot(tableName: String) throws -> SQLiteTableSnapshot? {
+        let rows = try fetchTableRows(tableName: tableName)
+        guard rows.isEmpty == false else {
+            return nil
+        }
+        return SQLiteTableSnapshot(
+            tableName: tableName,
+            schema: try fetchTableSchema(tableName: tableName),
+            rows: rows
+        )
+    }
+
+    public func fetchTableSnapshots(tableNames: [String]? = nil) throws -> [SQLiteTableSnapshot] {
+        let targetTableNames = try tableNames ?? getAllTableNames()
+        return try targetTableNames.compactMap { tableName in
+            try fetchTableSnapshot(tableName: tableName)
+        }
+    }
+
+    public func syncAllTablesToMySQL(
+        config: MySQLDirectSyncConfig,
+        tableNames: [String]? = nil,
+        batchSize: Int = 100
+    ) async throws -> MySQLDirectSyncResult {
+        let tables = try fetchTableSnapshots(tableNames: tableNames)
+        let client = MySQLDirectClient(config: config)
+        try await client.connect()
+        defer { client.disconnect() }
+        return try await client.syncTables(tables, batchSize: batchSize)
+    }
 }
