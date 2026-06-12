@@ -16,6 +16,8 @@ open class SensorConfig{
     public var dbEncryptionKey:String? = nil
     public var dbType:DatabaseType = .sqlite
     public var serverType:ServerType = .aware_micro
+    public var studyNumber:Int = 1
+    public var studyKey:String = ""
     public var dbPath:String = "aware"
     public var dbHost:String? = nil
     
@@ -65,6 +67,36 @@ open class SensorConfig{
         
         if let dbHost = config["dbHost"] as? String {
             self.dbHost = dbHost
+        }
+
+        if let serverType = config["serverType"] as? Int {
+            if serverType == 0 {
+                self.serverType = .none
+            } else if serverType == 1 {
+                self.serverType = .aware
+            } else if serverType == 2 {
+                self.serverType = .aware_micro
+            } else if serverType == 3 {
+                self.serverType = .aware_micro
+            } else if serverType == 4 {
+                self.serverType = .aware_light
+            }
+        }
+
+        if let serverType = config["serverType"] as? ServerType {
+            self.serverType = serverType
+        }
+
+        if let studyNumber = config["studyNumber"] as? Int {
+            self.studyNumber = studyNumber
+        } else if let studyNumber = config["study_number"] as? Int {
+            self.studyNumber = studyNumber
+        }
+
+        if let studyKey = config["studyKey"] as? String {
+            self.studyKey = studyKey
+        } else if let studyKey = config["study_key"] as? String {
+            self.studyKey = studyKey
         }
         
         if let dbTableName = config["dbTableName"] as? String {

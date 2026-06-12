@@ -10,7 +10,6 @@ public enum ServerType {
     case none
     case aware
     case aware_micro
-    case aware_x
     case aware_light
 }
 
