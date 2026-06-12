@@ -186,6 +186,20 @@ class UnitTests: XCTestCase {
         let results5 = engine.fetch(filter: nil, limit: nil)
         XCTAssertEqual((results5 ?? []).count, 0)
     }
+
+    func testSQLiteExportFileNaming() {
+        XCTAssertEqual(SQLiteEngine.sqliteFileName(for: "aware_accelerometer"), "aware_accelerometer.sqlite")
+        XCTAssertEqual(SQLiteEngine.sqliteFileName(for: "aware_accelerometer.sqlite"), "aware_accelerometer.sqlite")
+        XCTAssertEqual(SQLiteEngine.sqliteFileName(for: "  "), "aware.sqlite")
+        XCTAssertEqual(
+            SQLiteEngine.csvFileNameStem(databasePath: "aware_healthkit.sqlite", tableName: "ios_healthkit_heart_rate"),
+            "aware_healthkit__ios_healthkit_heart_rate"
+        )
+        XCTAssertEqual(
+            SQLiteEngine.csvFileNameStem(databasePath: "  ", tableName: "ios_screen_brightness"),
+            "aware__ios_screen_brightness"
+        )
+    }
     
     
     func getSmapleData() -> A {
