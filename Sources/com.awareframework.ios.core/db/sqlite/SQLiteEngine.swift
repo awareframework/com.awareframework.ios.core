@@ -7,6 +7,7 @@ open class SQLiteEngine: Engine {
     private static var databaseQueues: [String: DatabaseQueue] = [:]
     private static let databaseQueuesLock = NSLock()
     private static let retryLimit = 5
+    private static let sqliteExtension = ".sqlite"
 
     public override init(_ config: EngineConfig) {
         super.init(config)
@@ -23,6 +24,40 @@ open class SQLiteEngine: Engine {
     }
 
     // MARK: - Database access
+
+    public var sqliteFileName: String? {
+        config.path.map(Self.sqliteFileName(for:))
+    }
+
+    public var sqliteFileURL: URL? {
+        config.path.map(Self.fileURL(for:))
+    }
+
+    public static func sqliteFileName(for path: String) -> String {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        let stem: String
+        if trimmed.lowercased().hasSuffix(sqliteExtension) {
+            stem = String(trimmed.dropLast(sqliteExtension.count))
+        } else {
+            stem = trimmed
+        }
+        return "\(stem.isEmpty ? "aware" : stem)\(sqliteExtension)"
+    }
+
+    public static func csvFileNameStem(databasePath: String, tableName: String) -> String {
+        let databaseStem: String
+        let trimmedDatabasePath = databasePath.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmedDatabasePath.lowercased().hasSuffix(sqliteExtension) {
+            databaseStem = String(trimmedDatabasePath.dropLast(sqliteExtension.count))
+        } else {
+            databaseStem = trimmedDatabasePath
+        }
+        return "\(databaseStem.isEmpty ? "aware" : databaseStem)__\(tableName)"
+    }
+
+    public func csvFileNameStem(for tableName: String) -> String {
+        Self.csvFileNameStem(databasePath: config.path ?? "aware", tableName: tableName)
+    }
 
     public func getSQLiteInstance() -> DatabaseQueue? {
         guard let path = config.path else { return nil }
@@ -91,7 +126,7 @@ open class SQLiteEngine: Engine {
 
     private static func fileURL(for path: String) -> URL {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent(path + ".sqlite")
+            .appendingPathComponent(sqliteFileName(for: path))
     }
 
     // MARK: - Save
@@ -226,7 +261,9 @@ open class SQLiteEngine: Engine {
 
     open override func startSync(_ syncConfig: DbSyncConfig) {
         guard let host = config.host, let tableName = config.tableName else {
-            print("[Error][SQLiteEngine] host or tableName is nil.")
+            print(
+                "[Error][SQLiteEngine] host or tableName is nil. path=\(config.path ?? "nil"), host=\(config.host ?? "nil"), tableName=\(config.tableName ?? "nil")"
+            )
             return
         }
         syncHelper?.stop()
@@ -311,6 +348,7 @@ open class SQLiteEngine: Engine {
         }
         return SQLiteTableSnapshot(
             tableName: tableName,
+            exportFileNameStem: csvFileNameStem(for: tableName),
             schema: try fetchTableSchema(tableName: tableName),
             rows: rows
         )
