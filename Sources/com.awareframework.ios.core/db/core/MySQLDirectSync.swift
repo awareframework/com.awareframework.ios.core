@@ -1,6 +1,7 @@
 import CryptoKit
 import Foundation
 import Network
+import Security
 
 public struct MySQLDirectSyncConfig {
     public var host: String
@@ -42,11 +43,18 @@ public struct SQLiteTableColumn {
 
 public struct SQLiteTableSnapshot {
     public let tableName: String
+    public let exportFileNameStem: String
     public let schema: [SQLiteTableColumn]
     public let rows: [[String: Any]]
 
-    public init(tableName: String, schema: [SQLiteTableColumn], rows: [[String: Any]]) {
+    public init(
+        tableName: String,
+        exportFileNameStem: String? = nil,
+        schema: [SQLiteTableColumn],
+        rows: [[String: Any]]
+    ) {
         self.tableName = tableName
+        self.exportFileNameStem = exportFileNameStem ?? tableName
         self.schema = schema
         self.rows = rows
     }
@@ -81,13 +89,20 @@ public final class MySQLDirectClient {
         connection = conn
 
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            var resumed = false
             conn.stateUpdateHandler = { state in
                 switch state {
                 case .ready:
+                    guard !resumed else { return }
+                    resumed = true
                     cont.resume()
                 case .failed(let error):
+                    guard !resumed else { return }
+                    resumed = true
                     cont.resume(throwing: error)
                 case .cancelled:
+                    guard !resumed else { return }
+                    resumed = true
                     cont.resume(throwing: MySQLDirectSyncError.connectionCancelled)
                 default:
                     break
@@ -105,7 +120,32 @@ public final class MySQLDirectClient {
             database: config.database
         )
         try await sendPacket(response, sequenceId: 1)
-        try checkOKPacket(try await readPacket())
+        var authPacket = try await readPacket()
+
+        // Handle Authentication Method Switch Request (0xFE): MySQL 8.x sends this when the
+        // server's default auth plugin differs from what the user account is configured to use.
+        if authPacket.first == 0xFE {
+            let offset = 1
+            var end = offset
+            while end < authPacket.count && authPacket[end] != 0 { end += 1 }
+            let switchPlugin = String(data: authPacket[offset..<end], encoding: .utf8) ?? ""
+            // Plugin data follows the null-terminated name; mysql_native_password appends a
+            // trailing null that is not part of the 20-byte scramble, so strip it.
+            var newSeed = Data(authPacket.dropFirst(end + 1))
+            if newSeed.last == 0 { newSeed.removeLast() }
+
+            let switchToken: Data
+            switch switchPlugin {
+            case "mysql_native_password":
+                switchToken = mysqlNativePassword(password: config.password, seed: newSeed)
+            default:
+                throw MySQLDirectSyncError.unexpectedPacket("Unsupported auth switch plugin: \(switchPlugin)")
+            }
+            try await sendPacket(switchToken, sequenceId: 3)
+            authPacket = try await readPacket()
+        }
+
+        try checkOKPacket(authPacket)
     }
 
     public func disconnect() {
@@ -118,13 +158,13 @@ public final class MySQLDirectClient {
             return 0
         }
 
-        try await executeQuery(buildCreateTable(tableName: table.tableName, schema: table.schema))
+        try await executeQuery(MySQLDirectSQLBuilder.buildCreateTable(tableName: table.tableName, schema: table.schema))
 
         var inserted = 0
         let columns = table.schema.map(\.name)
         for start in stride(from: 0, to: table.rows.count, by: batchSize) {
             let batch = Array(table.rows[start..<min(start + batchSize, table.rows.count)])
-            try await executeQuery(buildInsert(tableName: table.tableName, columns: columns, rows: batch))
+            try await executeQuery(MySQLDirectSQLBuilder.buildInsert(tableName: table.tableName, columns: columns, rows: batch))
             inserted += batch.count
         }
         return inserted
@@ -279,7 +319,11 @@ public final class MySQLDirectClient {
         return String(data: messageData, encoding: .utf8) ?? "Unknown MySQL error"
     }
 
-    private func buildCreateTable(tableName: String, schema: [SQLiteTableColumn]) -> String {
+}
+
+enum MySQLDirectSQLBuilder {
+
+    static func buildCreateTable(tableName: String, schema: [SQLiteTableColumn]) -> String {
         let columns = schema.map { column -> String in
             let mysqlType = sqliteTypeToMySQL(column.type)
             let escapedName = escapeIdentifier(column.name)
@@ -287,15 +331,19 @@ public final class MySQLDirectClient {
                 ? "\(escapedName) \(mysqlType) NOT NULL AUTO_INCREMENT"
                 : "\(escapedName) \(mysqlType)"
         }
-        return "CREATE TABLE IF NOT EXISTS \(escapeIdentifier(tableName)) (\(columns.joined(separator: ", ")), PRIMARY KEY (`id`)) CHARACTER SET utf8mb4"
+        let primaryKey = primaryKeyClause(for: schema)
+        let definitions = (columns + [primaryKey]).joined(separator: ", ")
+        return "CREATE TABLE IF NOT EXISTS \(escapeIdentifier(tableName)) (\(definitions)) CHARACTER SET utf8mb4"
     }
 
-    private func sqliteTypeToMySQL(_ sqliteType: String) -> String {
+    static func sqliteTypeToMySQL(_ sqliteType: String) -> String {
         switch sqliteType.uppercased() {
         case "INTEGER", "INT":
             return "BIGINT"
         case "REAL", "FLOAT", "DOUBLE":
             return "DOUBLE"
+        case "BOOLEAN", "BOOL":
+            return "TINYINT(1)"
         case "BLOB":
             return "LONGBLOB"
         default:
@@ -303,10 +351,11 @@ public final class MySQLDirectClient {
         }
     }
 
-    private func buildInsert(tableName: String, columns: [String], rows: [[String: Any]]) -> String {
-        let columnList = columns.map { escapeIdentifier($0) }.joined(separator: ", ")
+    static func buildInsert(tableName: String, columns: [String], rows: [[String: Any]]) -> String {
+        let uploadColumns = columns.filter { $0 != "id" }
+        let columnList = uploadColumns.map { escapeIdentifier($0) }.joined(separator: ", ")
         let valueSets = rows.map { row -> String in
-            let values = columns.map { column -> String in
+            let values = uploadColumns.map { column -> String in
                 guard let value = row[column], (value is NSNull) == false else {
                     return "NULL"
                 }
@@ -317,11 +366,19 @@ public final class MySQLDirectClient {
         return "INSERT IGNORE INTO \(escapeIdentifier(tableName)) (\(columnList)) VALUES \(valueSets.joined(separator: ", "))"
     }
 
-    private func escapeIdentifier(_ identifier: String) -> String {
+    static func escapeIdentifier(_ identifier: String) -> String {
         "`\(identifier.replacingOccurrences(of: "`", with: "``"))`"
     }
 
-    private func escapeMySQLValue(_ value: Any) -> String {
+    private static func primaryKeyClause(for schema: [SQLiteTableColumn]) -> String {
+        let columnNames = Set(schema.map(\.name))
+        if columnNames.contains("id") {
+            return "PRIMARY KEY (`id`)"
+        }
+        return "PRIMARY KEY (\(schema.prefix(1).map { escapeIdentifier($0.name) }.joined(separator: ", ")))"
+    }
+
+    static func escapeMySQLValue(_ value: Any) -> String {
         switch value {
         case let number as NSNumber:
             return number.stringValue
