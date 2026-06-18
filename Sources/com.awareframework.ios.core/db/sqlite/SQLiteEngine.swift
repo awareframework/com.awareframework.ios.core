@@ -330,7 +330,10 @@ open class SQLiteEngine: Engine {
             return []
         }
         return try database.read { db in
-            let rows = try Row.fetchAll(db, sql: "SELECT * FROM \(tableName) ORDER BY id ASC")
+            let columns = try Row.fetchAll(db, sql: "PRAGMA table_info(\(tableName))")
+                .compactMap { $0["name"] as? String }
+            let orderClause = columns.contains("id") ? " ORDER BY id ASC" : ""
+            let rows = try Row.fetchAll(db, sql: "SELECT * FROM \(tableName)\(orderClause)")
             return rows.map { row in
                 var dict: [String: Any] = [:]
                 for column in row.columnNames {

@@ -49,7 +49,7 @@ Integrate this framework via Swift Package Manager (SwiftPM).
 
 ---
 
-## Usage
+## Example Usage
 
 ### 1. Define a data model
 
@@ -162,21 +162,19 @@ if let engine = sensor.dbEngine as? SQLiteEngine {
 
 ## DbSyncConfig Reference
 
-| Property | Type | Default | Description |
-|---|---|---|---|
-| `batchSize` | `Int` | `1000` | Records per upload batch |
-| `removeAfterSync` | `Bool` | `false` | Delete local records after successful upload |
-| `compactDataFormat` | `Bool` | `false` | Aggregate columns into arrays to reduce payload size |
-| `backgroundSession` | `Bool` | `false` | Use `URLSessionConfiguration.background` |
-| `serverType` | `ServerType` | `.aware_micro` | Target server protocol |
-| `studyNumber` | `Int` | `1` | Study number embedded in upload URL |
-| `studyKey` | `String` | `""` | Study key embedded in upload URL |
-| `debug` | `Bool` | `false` | Enable debug logging |
-| `debugLevel` | `DbSyncDebugLevel` | `.info` | Log verbosity: `.none` `.error` `.warning` `.info` `.verbose` `.trace` |
-| `test` | `Bool` | `false` | Skip real network calls (unit test mode) |
-| `progressHandler` | closure | `nil` | Called with `(Double, Error?)` during upload |
-| `completionHandler` | closure | `nil` | Called with `(Bool, Error?)` on finish |
-| `dispatchQueue` | `DispatchQueue?` | `nil` | Queue on which to run next-batch calls |
++ `batchSize: Int`: Records per upload batch. (default = `1000`)
++ `removeAfterSync: Bool`: Delete local records after successful upload. (default = `false`)
++ `compactDataFormat: Bool`: Aggregate columns into arrays to reduce payload size. (default = `false`)
++ `backgroundSession: Bool`: Use `URLSessionConfiguration.background`. (default = `false`)
++ `serverType: ServerType`: Target server protocol. (default = `.aware_micro`)
++ `studyNumber: Int`: Study number embedded in upload URL. (default = `1`)
++ `studyKey: String`: Study key embedded in upload URL. (default = `""`)
++ `debug: Bool`: Enable debug logging. (default = `false`)
++ `debugLevel: DbSyncDebugLevel`: Log verbosity: `.none`, `.error`, `.warning`, `.info`, `.verbose`, `.trace`. (default = `.info`)
++ `test: Bool`: Skip real network calls (unit test mode). (default = `false`)
++ `progressHandler: closure`: Called with `(Double, Error?)` during upload. (default = `nil`)
++ `completionHandler: closure`: Called with `(Bool, Error?)` on finish. (default = `nil`)
++ `dispatchQueue: DispatchQueue?`: Queue on which to run next-batch calls. (default = `nil`)
 
 ---
 
