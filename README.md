@@ -257,6 +257,17 @@ Every sensor data record must expose:
 
 ---
 
+## Related Links
+
+- [URLSession | Apple Developer Documentation](https://developer.apple.com/documentation/foundation/urlsession)
+- [URLSessionConfiguration | Apple Developer Documentation](https://developer.apple.com/documentation/foundation/urlsessionconfiguration)
+- [Network | Apple Developer Documentation](https://developer.apple.com/documentation/network)
+- [CryptoKit | Apple Developer Documentation](https://developer.apple.com/documentation/cryptokit)
+- [Security | Apple Developer Documentation](https://developer.apple.com/documentation/security)
+- [UIDevice | Apple Developer Documentation](https://developer.apple.com/documentation/uikit/uidevice)
+
+---
+
 ## Author
 
 Yuuki Nishiyama (The University of Tokyo), nishiyama@csis.u-tokyo.ac.jp
