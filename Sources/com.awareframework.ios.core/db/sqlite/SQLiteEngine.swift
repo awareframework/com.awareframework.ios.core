@@ -280,6 +280,42 @@ open class SQLiteEngine: Engine {
         }
     }
 
+    /// Deletes uploaded rows in small transactions so that sensors can keep writing in between.
+    /// Each chunk looks only at the `chunkSize` oldest uploaded rows, so it needs no index on
+    /// `timestamp`. A row whose timestamp is newer than the cutoff stays and is checked again later.
+    @discardableResult
+    open override func removeUploaded(upToId: Int64, olderThan timestamp: Int64?, chunkSize: Int, maxChunks: Int) -> Int {
+        guard let tableName = config.tableName, chunkSize > 0, maxChunks > 0,
+              let queue = getSQLiteInstance() else { return 0 }
+        var sql = "DELETE FROM \(tableName) WHERE id IN "
+            + "(SELECT id FROM \(tableName) WHERE id <= ? ORDER BY id LIMIT ?)"
+        var arguments: StatementArguments = [upToId, chunkSize]
+        if let timestamp = timestamp {
+            sql += " AND timestamp < ?"
+            arguments += [timestamp]
+        }
+        var total = 0
+        for _ in 0..<maxChunks {
+            var deleted = 0
+            do {
+                try Self.retryLockedDatabaseWork {
+                    try queue.write { db in
+                        try db.execute(sql: "PRAGMA busy_timeout = 10000")
+                        try db.execute(sql: sql, arguments: arguments)
+                        deleted = db.changesCount
+                    }
+                }
+            } catch {
+                print("[Error][SQLiteEngine] removeUploaded failed: \(error)")
+                break
+            }
+            total += deleted
+            // A partial chunk means the oldest uploaded rows are not old enough yet (or none are left)
+            if deleted < chunkSize { break }
+        }
+        return total
+    }
+
     // MARK: - Sync
 
     /// The upload of one table of one database. Shared by every engine of that table, so that two

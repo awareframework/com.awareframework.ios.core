@@ -46,7 +46,7 @@ class UnitTests: XCTestCase {
     
     func testInitializationOnDbSyncConfig(){
         let config1 = DbSyncConfig.init()
-        XCTAssertFalse(config1.removeAfterSync)
+        XCTAssertTrue(config1.removeAfterSync)
         XCTAssertEqual(config1.batchSize, 1000)
         XCTAssertFalse(config1.markAsSynced)
         XCTAssertFalse(config1.skipSyncedData)
@@ -82,7 +82,7 @@ class UnitTests: XCTestCase {
             "deviceId":123,
             "debug":"hoge"]
         let config3 = DbSyncConfig.init(dict3)
-        XCTAssertFalse(config3.removeAfterSync)
+        XCTAssertTrue(config3.removeAfterSync)  // a wrong type keeps the default
         XCTAssertEqual(config3.batchSize, 1000)
         XCTAssertFalse(config3.markAsSynced)
         XCTAssertFalse(config3.skipSyncedData)
@@ -271,6 +271,172 @@ class UnitTests: XCTestCase {
         
     }
     
+    /// After a batch is uploaded, only that batch is deleted. Rows saved while the request was in
+    /// flight (larger IDs) must stay, and the DELETE must run on the system SQLite (no LIMIT clause).
+    func testRemoveUploadedCandidatesDeletesOnlyTheUploadedBatch() {
+        let sensor = AwareSensor()
+        let config = SensorConfig()
+        config.dbHost = "node.awareframework.com:1001"
+        config.dbType = .sqlite
+        config.dbPath = "remove_after_sync_test"
+        config.dbTableName = A.databaseTableName
+        sensor.initializeDbEngine(config: config)
+        guard let engine = sensor.dbEngine as? SQLiteEngine, let queue = engine.getSQLiteInstance() else {
+            return XCTFail("SQLite engine is not available")
+        }
+        A.createTable(queue: queue)
+        engine.removeAll()
+        engine.save((0..<10).map { _ in self.getSmapleData() } as [any BaseDbModelSQLite])
+        let ids = (engine.fetch(filter: nil, limit: nil) ?? []).compactMap { $0["id"] as? Int64 }.sorted()
+        XCTAssertEqual(ids.count, 10)
+
+        let helper = DbSyncHelper(engine: engine, host: config.dbHost!, tableName: A.databaseTableName,
+                                  config: DbSyncConfig().apply { $0.keepDataAfterSync = 0 })
+        // The first 4 rows were uploaded; the other 6 were saved while the request was in flight.
+        helper.idOfLastCandidate = ids[3]
+        helper.removeUploadedCandidates(lastUploadedId: ids[0] - 1, limit: 1000)
+
+        let remaining = (engine.fetch(filter: nil, limit: nil) ?? []).compactMap { $0["id"] as? Int64 }.sorted()
+        XCTAssertEqual(remaining, Array(ids[4...]))
+
+        // Without an uploaded batch nothing is deleted.
+        helper.idOfLastCandidate = nil
+        helper.removeUploadedCandidates(lastUploadedId: ids[3], limit: 1000)
+        XCTAssertEqual(engine.count(filter: nil), 6)
+        engine.removeAll()
+    }
+
+    func testKeepDataAfterSyncConfig() {
+        let config = DbSyncConfig()
+        XCTAssertEqual(config.keepDataAfterSync, 86400)  // one day
+        XCTAssertEqual(config.keepPeriod, .day)
+
+        config.keepPeriod = .week
+        XCTAssertEqual(config.keepDataAfterSync, 604800)
+        config.keepDataAfterSync = 90
+        XCTAssertNil(config.keepPeriod)  // not one of the periods
+        config.keepDataAfterSync = -1  // ignored
+        XCTAssertEqual(config.keepDataAfterSync, 90)
+        config.keepPeriod = .immediately
+        XCTAssertEqual(config.keepDataAfterSync, 0)
+
+        XCTAssertEqual(DbSyncConfig(["keepDataAfterSync": 3600]).keepPeriod, .hour)
+        XCTAssertEqual(DbSyncConfig(["keepDataAfterSync": 1.5]).keepDataAfterSync, 1.5)
+        XCTAssertEqual(DbSyncConfig(["keepPeriod": "Month"]).keepDataAfterSync, 60 * 60 * 24 * 30)
+        XCTAssertEqual(DbSyncConfig(["keepPeriod": "year"]).keepDataAfterSync, 86400)  // unknown name keeps the default
+        XCTAssertEqual(DbSyncConfig(["keepDataAfterSync": "3600"]).keepDataAfterSync, 86400)  // wrong type
+    }
+
+    /// `copy()` copies every stored property. Each property is first set to a non-default value;
+    /// a property added to `DbSyncConfig` without updating this test (and `copy()`) makes it fail.
+    func testDbSyncConfigCopy() {
+        let original = DbSyncConfig()
+        original.removeAfterSync = false
+        original.keepDataAfterSync = 123
+        original.batchSize = 42
+        original.markAsSynced = true
+        original.skipSyncedData = true
+        original.keepLastData = true
+        original.deviceId = "device-1"
+        original.debug = true
+        original.debugLevel = .trace
+        original.completionHandler = { _, _ in }
+        original.progressHandler = { _, _ in }
+        original.dispatchQueue = DispatchQueue(label: "copy.test")
+        original.backgroundSession = true
+        original.compactDataFormat = !DbSyncConfig.defaultCompactDataFormat
+        original.serverType = DbSyncConfig.defaultServerType == .aware_micro ? .aware_light : .aware_micro
+        original.studyNumber = DbSyncConfig.defaultStudyNumber + 1
+        original.studyKey = DbSyncConfig.defaultStudyKey + "-key"
+        original.test = true
+
+        let copy = original.copy()
+        XCTAssertFalse(copy === original)
+
+        func values(_ c: DbSyncConfig) -> [String: String] {
+            Dictionary(uniqueKeysWithValues: Mirror(reflecting: c).children.compactMap { child in
+                child.label.map { ($0, String(describing: child.value)) }
+            })
+        }
+        let defaults = values(DbSyncConfig()), originals = values(original), copies = values(copy)
+        XCTAssertEqual(originals.count, 18, "a property was added or removed: update copy() and this test")
+        for (name, value) in originals {
+            XCTAssertNotEqual(value, defaults[name], "\(name) is not set in this test")
+            XCTAssertEqual(copies[name], value, "\(name) is not copied by copy()")
+        }
+        XCTAssertTrue(copy.dispatchQueue === original.dispatchQueue)
+
+        // Changing the copy does not change the original
+        copy.batchSize = 7
+        copy.completionHandler = nil
+        XCTAssertEqual(original.batchSize, 42)
+        XCTAssertNotNil(original.completionHandler)
+    }
+
+    /// Makes a SQLite engine with an empty table `A` in its own database file.
+    private func makeEmptySQLiteEngine(_ dbPath: String) -> SQLiteEngine? {
+        let sensor = AwareSensor()
+        let config = SensorConfig()
+        config.dbHost = "node.awareframework.com:1001"
+        config.dbType = .sqlite
+        config.dbPath = dbPath
+        config.dbTableName = A.databaseTableName
+        sensor.initializeDbEngine(config: config)
+        guard let engine = sensor.dbEngine as? SQLiteEngine, let queue = engine.getSQLiteInstance() else { return nil }
+        A.createTable(queue: queue)
+        engine.removeAll()
+        return engine
+    }
+
+    private func sample(at timestamp: Int64) -> A {
+        var a = getSmapleData()
+        a.timestamp = timestamp
+        return a
+    }
+
+    private func ids(_ engine: Engine) -> [Int64] {
+        (engine.fetch(filter: nil, limit: nil) ?? []).compactMap { $0["id"] as? Int64 }.sorted()
+    }
+
+    /// With the default (keep one day), only uploaded rows older than a day are deleted.
+    /// Recent uploaded rows and rows that have not been uploaded (even old ones) stay.
+    func testRemoveUploadedCandidatesKeepsRecentData() {
+        guard let engine = makeEmptySQLiteEngine("keep_data_after_sync_test") else {
+            return XCTFail("SQLite engine is not available")
+        }
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        let twoDaysAgo = now - 2 * 86_400_000
+        let rows: [any BaseDbModelSQLite] = (0..<3).map { _ in sample(at: twoDaysAgo) }  // uploaded, old
+            + (0..<3).map { _ in sample(at: now) }                                       // uploaded, recent
+            + (0..<2).map { _ in sample(at: twoDaysAgo) }                                // not uploaded, old timestamp
+        engine.save(rows)
+        let all = ids(engine)
+        XCTAssertEqual(all.count, 8)
+
+        let helper = DbSyncHelper(engine: engine, host: "node.awareframework.com:1001",
+                                  tableName: A.databaseTableName, config: DbSyncConfig())
+        helper.idOfLastCandidate = all[5]  // rows up to the 6th were uploaded
+        helper.removeUploadedCandidates(lastUploadedId: all[2], limit: 1000)
+
+        XCTAssertEqual(ids(engine), Array(all[3...]))
+        engine.removeAll()
+    }
+
+    /// Uploaded rows are deleted a chunk at a time, and no more than `maxChunks` chunks per call.
+    func testRemoveUploadedDeletesInChunks() {
+        guard let engine = makeEmptySQLiteEngine("remove_uploaded_chunks_test") else {
+            return XCTFail("SQLite engine is not available")
+        }
+        engine.save((0..<12).map { _ in sample(at: 1_000) } as [any BaseDbModelSQLite])
+        let all = ids(engine)
+
+        XCTAssertEqual(engine.removeUploaded(upToId: all[11], olderThan: 2_000, chunkSize: 5, maxChunks: 2), 10)
+        XCTAssertEqual(ids(engine), Array(all[10...]))
+        XCTAssertEqual(engine.removeUploaded(upToId: all[11], olderThan: 2_000, chunkSize: 5, maxChunks: 2), 2)
+        XCTAssertEqual(engine.count(filter: nil), 0)
+        engine.removeAll()
+    }
+
     func testSyncHelpers () {
         
         

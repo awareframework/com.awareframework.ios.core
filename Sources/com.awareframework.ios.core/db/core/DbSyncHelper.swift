@@ -621,21 +621,43 @@ open class DbSyncHelper: NSObject {
         return candidates ?? []
     }
 
+    /// Rows deleted per transaction, and transactions per call, by `removeUploadedCandidates`.
+    static let removeChunkSize = 5000
+    static let removeMaxChunks = 10
+
     /**
      * Remove uploaded candidate data
      *
-     * Deletes uploaded data to save local storage space
-     * after synchronization completion.
+     * Called after a batch is uploaded. Deletes uploaded rows (`id <= idOfLastCandidate`) whose
+     * `timestamp` is older than `config.keepDataAfterSync` seconds, oldest first, in chunks of
+     * `removeChunkSize` rows (at most `removeMaxChunks` chunks per call). With
+     * `keepDataAfterSync == 0` every uploaded row is deleted.
      *
-     * @param lastUploadedId Base ID for deletion target
-     * @param limit Maximum number of items to delete
+     * Rows with an ID above `idOfLastCandidate` have not been uploaded (some were saved while the
+     * request was in flight), so they are never deleted. Each call also removes older uploaded rows
+     * that a previous call did not delete, a chunk at a time, so a large backlog is never deleted
+     * in one transaction. `DELETE ... LIMIT` is not used, since it depends on the SQLite build option
+     * `SQLITE_ENABLE_UPDATE_DELETE_LIMIT`. Row IDs use AUTOINCREMENT, so an ID is never reused.
+     *
+     * @param lastUploadedId ID of the last row uploaded before this batch
+     * @param limit Unused. Kept for source compatibility.
      */
     open func removeUploadedCandidates(lastUploadedId: Int64, limit: Int) {
-        let filter = "id > \(lastUploadedId)"
-        if self.config.debug {
-            logVerbose("Remove uploaded data: \(filter) & limit \(limit)")
+        guard let uploadedUpToId = idOfLastCandidate, uploadedUpToId > lastUploadedId else {
+            if self.config.debug {
+                logVerbose("Remove uploaded data: skipped (no uploaded batch)")
+            }
+            return
         }
-        self.engine.remove(filter: filter, limit: limit)
+        let keep = config.keepDataAfterSync
+        let cutoff: Int64? = keep > 0 ? Int64((Date().timeIntervalSince1970 - keep) * 1000) : nil
+        let removed = self.engine.removeUploaded(upToId: uploadedUpToId, olderThan: cutoff,
+                                                 chunkSize: Self.removeChunkSize,
+                                                 maxChunks: Self.removeMaxChunks)
+        if self.config.debug {
+            logVerbose("Remove uploaded data: id <= \(uploadedUpToId)"
+                       + (cutoff.map { " AND timestamp < \($0)" } ?? "") + " -> \(removed) rows")
+        }
     }
 
     // MARK: - Private Helper Methods

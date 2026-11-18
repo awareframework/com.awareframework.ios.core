@@ -190,6 +190,7 @@ sensor.enable()   // subscribes to sync broadcast
 let syncConfig = DbSyncConfig()
 syncConfig.batchSize        = 500
 syncConfig.removeAfterSync  = true
+syncConfig.keepPeriod       = .day   // or keepDataAfterSync = 86400 (seconds)
 syncConfig.compactDataFormat = false
 syncConfig.debug            = true
 syncConfig.debugLevel       = .verbose
@@ -324,7 +325,9 @@ Per-table upload settings, used by `DbSyncHelper`.
 | `studyNumber: Int` | `DbSyncConfig.defaultStudyNumber` (`1`) | Study number in the upload URL. |
 | `studyKey: String` | `DbSyncConfig.defaultStudyKey` (`""`) | Study key in the upload URL. |
 | `batchSize: Int` | `1000` | Rows per upload request. Larger backlogs are sent in several requests in one sync. |
-| `removeAfterSync: Bool` | `false` | Delete rows from the local database after they are uploaded successfully. |
+| `removeAfterSync: Bool` | `true` | Delete uploaded rows from the local database once they are older than `keepDataAfterSync`. Rows that have not been uploaded are never deleted. Set `false` to keep every row. |
+| `keepDataAfterSync: TimeInterval` | `86400` (one day) | Seconds to keep uploaded rows on the device, counted from each row's `timestamp`. `0` deletes them right after upload. Negative values are ignored. Dictionary key: `"keepDataAfterSync"`. |
+| `keepPeriod: DbSyncConfig.KeepPeriod?` | `.day` | `keepDataAfterSync` as a period: `.immediately` (0), `.hour`, `.day`, `.week`, `.month` (30 days). Setting it sets `keepDataAfterSync`; reading it gives `nil` for other values. Dictionary key: `"keepPeriod"` (e.g. `"week"`). |
 | `compactDataFormat: Bool` | `DbSyncConfig.defaultCompactDataFormat` (`false`) | Send columns as arrays, and omit `os`, `jsonVersion`, `deviceId` and `timezone`, to reduce payload size. |
 | `backgroundSession: Bool` | `false` | Use a background `URLSession` (`URLSessionConfiguration.background`). |
 | `debug: Bool` | `false` | Enable debug logging. |
@@ -336,6 +339,8 @@ Per-table upload settings, used by `DbSyncHelper`.
 | `markAsSynced`, `skipSyncedData`, `keepLastData: Bool` | `false` | Reserved. `DbSyncHelper` does not currently use them. Use `removeAfterSync` to delete uploaded rows. |
 | `deviceId: String?` | `nil` | Reserved. Rows carry the device ID from `SensorConfig.deviceId`. |
 
+`copy()` returns a new `DbSyncConfig` with the same values (handlers and the queue are shared). A sensor that uploads several tables should start each table's config from `syncConfig.copy()` and then change only what differs per table, such as `completionHandler` and `dispatchQueue`, so that no setting is lost.
+
 All settings can also be given as a dictionary with `DbSyncConfig(_:)` or `set(config:)`, e.g. `["batchSize": 500, "studyKey": "my-study-key"]`.
 
 ---
@@ -345,13 +350,17 @@ All settings can also be given as a dictionary with `DbSyncConfig(_:)` or `set(c
 `DbSyncHelper` uploads each table incrementally:
 
 1. **Progress is tracked by row ID.** Every table of every database stores the ID of the last row uploaded successfully in `UserDefaults` (see [Sync markers](#sync-markers)). A sync sends rows with `id` greater than that value, in batches of `batchSize`, in ID order.
-2. **Only HTTP 2xx counts as success.** The last uploaded ID advances (and, with `removeAfterSync`, the uploaded rows are deleted) only after the server answers with a 2xx status.
+2. **Only HTTP 2xx counts as success.** The last uploaded ID advances (and, with `removeAfterSync`, uploaded rows older than `keepDataAfterSync` are deleted) only after the server answers with a 2xx status.
 3. **Failed rows are retried.** On a non-2xx status, a network error, or a timeout (30 s per request), the last uploaded ID does not change and the sync of that table stops. The same rows are sent again at the next sync. Nothing is lost while the server is down, and the backlog is sent in batches once it is back.
 4. **Uploaded rows are not sent again.** Rows at or below the last uploaded ID are never selected again, whether or not they are kept locally.
 5. **Delivery is at least once.** If the server stores a batch but the response does not reach the app (for example, the app is killed while waiting), that batch is sent again at the next sync. Servers should tolerate duplicates, for example by ignoring rows with the same `timestamp` and device ID.
 6. **One sync per table at a time.** When a sync is requested while another sync of the same table of the same database is running (for example, `DbSyncManager.sync()` followed by `sensor.sync(force: true)`), the running sync is not stopped. Stopping it would cancel a request that the server may already have stored, and its rows would be sent again. Instead, one more sync runs after the current one, however many requests were made meanwhile, and every completion handler is called. A sync with no activity for 330 s is treated as stopped, and the next request starts a new one.
 
 The last uploaded ID survives app restarts. Deleting the app resets it.
+
+### Removing uploaded rows
+
+With `removeAfterSync`, each successful batch is followed by a cleanup of uploaded rows (`id` at or below the last uploaded ID) whose `timestamp` is older than now minus `keepDataAfterSync`. Rows saved while a request is in flight have larger IDs and are never deleted before they are uploaded. Rows are deleted oldest first, 5,000 per transaction and at most 50,000 per batch, so sensors can keep writing and a large backlog of old rows (for example, after updating from a version that did not delete) is cleared over several syncs instead of in one long transaction. Because the cutoff uses each row's `timestamp`, a device clock that jumps forward deletes uploaded rows earlier; rows that have not been uploaded are not affected.
 
 ### Sync markers
 

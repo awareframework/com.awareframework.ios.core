@@ -5,6 +5,8 @@
 ///
 /// - Properties:
 ///   - removeAfterSync: A boolean indicating whether to remove data after synchronization. Default is `true`.
+///   - keepDataAfterSync: Seconds to keep uploaded data on the device before `removeAfterSync` deletes it. Default is one day (`86400`).
+///   - keepPeriod: `keepDataAfterSync` as a period (`.immediately`, `.hour`, `.day`, `.week`, `.month`).
 ///   - batchSize: An integer specifying the number of records to sync in each batch. Default is `1000`.
 ///   - markAsSynced: A boolean indicating whether to mark data as synced after synchronization. Default is `false`.
 ///   - skipSyncedData: A boolean indicating whether to skip already synced data. Default is `false`.
@@ -66,7 +68,46 @@ public class DbSyncConfig {
     public static var defaultStudyKey: String = ""
     public static var defaultCompactDataFormat: Bool = false
 
-    public var removeAfterSync: Bool = false
+    public var removeAfterSync: Bool = true
+
+    /// Periods that can be used for `keepDataAfterSync`.
+    public enum KeepPeriod: String, CaseIterable {
+        case immediately  // delete right after upload
+        case hour
+        case day
+        case week
+        case month  // 30 days
+
+        public var seconds: TimeInterval {
+            switch self {
+            case .immediately: return 0
+            case .hour: return 60 * 60
+            case .day: return 60 * 60 * 24
+            case .week: return 60 * 60 * 24 * 7
+            case .month: return 60 * 60 * 24 * 30
+            }
+        }
+    }
+
+    /// Seconds to keep uploaded rows on the device before `removeAfterSync` deletes them,
+    /// counted from each row's `timestamp`. `0` deletes them right after upload.
+    /// Rows that have not been uploaded are never deleted. Negative values are ignored.
+    public var keepDataAfterSync: TimeInterval = KeepPeriod.day.seconds {
+        didSet {
+            if keepDataAfterSync < 0 || !keepDataAfterSync.isFinite {
+                print("[AWARE::Core][Illegal Parameter] keepDataAfterSync must be 0 or more seconds. "
+                      + "'\(keepDataAfterSync)' is ignored.")
+                keepDataAfterSync = oldValue
+            }
+        }
+    }
+
+    /// `keepDataAfterSync` as a period. Setting it sets `keepDataAfterSync`; reading it returns the
+    /// matching period, or `nil` when `keepDataAfterSync` is not one of them.
+    public var keepPeriod: KeepPeriod? {
+        get { KeepPeriod.allCases.first { $0.seconds == keepDataAfterSync } }
+        set { if let period = newValue { keepDataAfterSync = period.seconds } }
+    }
     public var batchSize: Int = 1000
     public var markAsSynced: Bool = false
     public var skipSyncedData: Bool = false
@@ -93,9 +134,46 @@ public class DbSyncConfig {
         set(config: config)
     }
 
+    /// Returns a new config with the same values. Sensors that upload several tables use it to give
+    /// each table its own config (for example its own `completionHandler` and `dispatchQueue`)
+    /// without missing settings. Handlers and the queue are shared, not duplicated.
+    /// When adding a property to `DbSyncConfig`, copy it here too (`testDbSyncConfigCopy` checks it).
+    public func copy() -> DbSyncConfig {
+        let c = DbSyncConfig()
+        c.removeAfterSync = removeAfterSync
+        c.keepDataAfterSync = keepDataAfterSync
+        c.batchSize = batchSize
+        c.markAsSynced = markAsSynced
+        c.skipSyncedData = skipSyncedData
+        c.keepLastData = keepLastData
+        c.deviceId = deviceId
+        c.debug = debug
+        c.debugLevel = debugLevel
+        c.completionHandler = completionHandler
+        c.progressHandler = progressHandler
+        c.dispatchQueue = dispatchQueue
+        c.backgroundSession = backgroundSession
+        c.compactDataFormat = compactDataFormat
+        c.serverType = serverType
+        c.studyNumber = studyNumber
+        c.studyKey = studyKey
+        c.test = test
+        return c
+    }
+
     public func set(config: [String: Any]) {
         if let removeAfterSync = config["removeAfterSync"] as? Bool {
             self.removeAfterSync = removeAfterSync
+        }
+
+        // Seconds ("keepDataAfterSync") or a period name ("keepPeriod": "immediately", "hour", "day", "week", "month")
+        if let seconds = config["keepDataAfterSync"] as? Int {
+            self.keepDataAfterSync = TimeInterval(seconds)
+        } else if let seconds = config["keepDataAfterSync"] as? Double {
+            self.keepDataAfterSync = seconds
+        }
+        if let name = config["keepPeriod"] as? String, let period = KeepPeriod(rawValue: name.lowercased()) {
+            self.keepPeriod = period
         }
 
         if let batchSize = config["batchSize"] as? Int {
