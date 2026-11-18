@@ -59,6 +59,29 @@ open class SQLiteEngine: Engine {
         Self.csvFileNameStem(databasePath: config.path ?? "aware", tableName: tableName)
     }
 
+    /// The database file name (for example `aware_battery.sqlite`), so that `aware_battery`
+    /// and `aware_battery.sqlite` identify the same database.
+    open override var databaseIdentifier: String {
+        Self.sqliteFileName(for: config.path ?? "aware")
+    }
+
+    /// The largest row ID ever assigned in the table. Tables use AUTOINCREMENT, so SQLite keeps this
+    /// in `sqlite_sequence` even after rows are deleted. Returns 0 for a table that never had a row,
+    /// and `nil` when the database cannot be read.
+    open override func maxAssignedId(tableName: String) -> Int64? {
+        guard let queue = getSQLiteInstance() else { return nil }
+        return try? queue.read { db -> Int64 in
+            if try db.tableExists("sqlite_sequence"),
+               let seq = try Int64.fetchOne(db, sql: "SELECT seq FROM sqlite_sequence WHERE name = ?",
+                                            arguments: [tableName]) {
+                return seq
+            }
+            // A table without AUTOINCREMENT, or one that never had a row
+            guard try db.tableExists(tableName) else { return 0 }
+            return try Int64.fetchOne(db, sql: "SELECT MAX(id) FROM \(tableName)") ?? 0
+        }
+    }
+
     public func getSQLiteInstance() -> DatabaseQueue? {
         guard let path = config.path else { return nil }
         do {
@@ -259,17 +282,81 @@ open class SQLiteEngine: Engine {
 
     // MARK: - Sync
 
+    /// The upload of one table of one database. Shared by every engine of that table, so that two
+    /// syncs of the same rows never run at the same time.
+    final class SyncSlot {
+        var helper: DbSyncHelper?
+        var running = false
+        /// A sync requested while another one was running: it runs once, after the current one
+        var pendingConfig: DbSyncConfig?
+        var pendingEngine: SQLiteEngine?
+        var pendingCompletions: [DbSyncCompletionHandler] = []
+    }
+
+    private static var syncSlots: [String: SyncSlot] = [:]
+    private static let syncSlotsLock = NSLock()
+
+    /// A running sync with no activity for this long is treated as stopped (a request waits at most
+    /// 300 s), and the next request starts a new sync instead of waiting for it.
+    static let staleSyncInterval: TimeInterval = 330
+
+    /**
+     * Upload the rows of this engine's table.
+     *
+     * Only one sync of a database table runs at a time. When a sync is requested while another
+     * one of the same table is running, the running sync is not stopped: stopping it would cancel
+     * a request that the server may already have stored, so its rows would be sent again. Instead,
+     * the request is remembered and one more sync runs after the current one finishes. Any number
+     * of requests made during a sync lead to one more sync, and every completion handler is called
+     * when that sync finishes.
+     */
     open override func startSync(_ syncConfig: DbSyncConfig) {
-        guard let host = config.host, let tableName = config.tableName else {
+        guard config.host != nil, let tableName = config.tableName else {
             print(
                 "[Error][SQLiteEngine] host or tableName is nil. path=\(config.path ?? "nil"), host=\(config.host ?? "nil"), tableName=\(config.tableName ?? "nil")"
             )
             return
         }
-        syncHelper?.stop()
-        syncHelper = DbSyncHelper(
-            engine: self, host: host, tableName: tableName, config: syncConfig)
-        let run = { self.syncHelper?.run(completion: syncConfig.completionHandler) }
+        let slotKey = "\(databaseIdentifier):\(tableName)"
+        Self.syncSlotsLock.lock()
+        let slot = Self.syncSlots[slotKey] ?? SyncSlot()
+        Self.syncSlots[slotKey] = slot
+        if slot.running {
+            let idle = Date().timeIntervalSince1970 - (slot.helper?.lastActivity ?? 0)
+            if idle < Self.staleSyncInterval {
+                slot.pendingConfig = syncConfig
+                slot.pendingEngine = self
+                if let completion = syncConfig.completionHandler {
+                    slot.pendingCompletions.append(completion)
+                }
+                Self.syncSlotsLock.unlock()
+                if syncConfig.debug {
+                    print("[AWARE::Core] A sync of \(slotKey) is running; one more sync runs after it")
+                }
+                return
+            }
+            print("[AWARE::Core] The sync of \(slotKey) has not responded for \(Int(idle)) s; starting a new sync")
+            slot.helper?.stop()
+        }
+        slot.running = true
+        Self.syncSlotsLock.unlock()
+        launchSync(slot, syncConfig, completions: syncConfig.completionHandler.map { [$0] } ?? [])
+    }
+
+    private func launchSync(_ slot: SyncSlot, _ syncConfig: DbSyncConfig,
+                            completions: [DbSyncCompletionHandler]) {
+        guard let host = config.host, let tableName = config.tableName else { return }
+        let helper = DbSyncHelper(engine: self, host: host, tableName: tableName, config: syncConfig)
+        Self.syncSlotsLock.lock()
+        slot.helper = helper
+        Self.syncSlotsLock.unlock()
+        syncHelper = helper
+        let run = {
+            helper.run { status, error in
+                completions.forEach { $0(status, error) }
+                Self.finishSync(slot, helper: helper)
+            }
+        }
         if let queue = syncConfig.dispatchQueue {
             queue.async { run() }
         } else {
@@ -277,8 +364,42 @@ open class SQLiteEngine: Engine {
         }
     }
 
+    /// Called when a sync finishes: runs the remembered request, if any.
+    private static func finishSync(_ slot: SyncSlot, helper: DbSyncHelper) {
+        syncSlotsLock.lock()
+        // A sync that was replaced after it stopped responding no longer owns the slot.
+        guard slot.helper === helper else {
+            syncSlotsLock.unlock()
+            return
+        }
+        guard let next = slot.pendingConfig, let engine = slot.pendingEngine else {
+            slot.running = false
+            slot.helper = nil
+            syncSlotsLock.unlock()
+            return
+        }
+        let completions = slot.pendingCompletions
+        slot.pendingConfig = nil
+        slot.pendingEngine = nil
+        slot.pendingCompletions = []
+        syncSlotsLock.unlock()
+        engine.launchSync(slot, next, completions: completions)
+    }
+
     open override func stopSync() {
-        syncHelper?.stop()
+        guard let helper = syncHelper else { return }
+        helper.stop()
+        if let tableName = config.tableName {
+            Self.syncSlotsLock.lock()
+            if let slot = Self.syncSlots["\(databaseIdentifier):\(tableName)"], slot.helper === helper {
+                slot.running = false
+                slot.helper = nil
+                slot.pendingConfig = nil
+                slot.pendingEngine = nil
+                slot.pendingCompletions = []
+            }
+            Self.syncSlotsLock.unlock()
+        }
     }
 
     open override func close() {}
