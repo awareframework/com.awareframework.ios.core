@@ -107,6 +107,7 @@ open class SQLiteEngine: Engine {
             try db.execute(sql: "PRAGMA foreign_keys = ON")
         }
 
+        try createParentDirectory(ofDatabaseAt: path)
         let queue = try retryLockedDatabaseWork {
             try DatabaseQueue(path: path, configuration: configuration)
         }
@@ -145,6 +146,16 @@ open class SQLiteEngine: Engine {
 
     private static func retryDelay(for attempt: Int) -> TimeInterval {
         0.05 * Double(attempt + 1)
+    }
+
+    /// Creates the directory that will hold the database file, if it is missing. SQLite does not create
+    /// directories, so opening the database fails without it. The Documents directory exists in an app,
+    /// but not, for example, when Swift package tests run on the iOS Simulator without a host app.
+    static func createParentDirectory(ofDatabaseAt path: String) throws {
+        let directory = URL(fileURLWithPath: path).deletingLastPathComponent()
+        if !FileManager.default.fileExists(atPath: directory.path) {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        }
     }
 
     private static func fileURL(for path: String) -> URL {
