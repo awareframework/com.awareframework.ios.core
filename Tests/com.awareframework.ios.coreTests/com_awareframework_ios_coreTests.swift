@@ -373,6 +373,24 @@ class UnitTests: XCTestCase {
         XCTAssertNotNil(original.completionHandler)
     }
 
+    /// The directory of the database file is created when it is missing, so the database can be opened.
+    func testCreateParentDirectoryOfDatabase() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("aware_dir_test_\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let path = root.appendingPathComponent("nested/Documents/a.sqlite").path
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.path))
+
+        try SQLiteEngine.createParentDirectory(ofDatabaseAt: path)
+        var isDirectory: ObjCBool = false
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("nested/Documents").path,
+                                                     isDirectory: &isDirectory))
+        XCTAssertTrue(isDirectory.boolValue)
+        XCTAssertNoThrow(try DatabaseQueue(path: path))
+
+        // An existing directory is left as it is
+        XCTAssertNoThrow(try SQLiteEngine.createParentDirectory(ofDatabaseAt: path))
+    }
+
     /// Makes a SQLite engine with an empty table `A` in its own database file.
     private func makeEmptySQLiteEngine(_ dbPath: String) -> SQLiteEngine? {
         let sensor = AwareSensor()
