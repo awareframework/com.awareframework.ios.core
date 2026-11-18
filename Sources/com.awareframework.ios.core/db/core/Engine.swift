@@ -111,6 +111,17 @@ open class Engine: EngineProtocal {
 
     public func remove(filter: String?, limit: Int?, completion: ((Error?) -> Void)?) {}
 
+    /// Deletes uploaded rows (`id <= upToId`), oldest ID first, in chunks of `chunkSize` rows and at
+    /// most `maxChunks` chunks. With `olderThan` (Unix time in ms), only rows whose `timestamp` is
+    /// smaller are deleted. Returns the number of deleted rows, or `0` when the engine cannot tell.
+    @discardableResult
+    open func removeUploaded(upToId: Int64, olderThan timestamp: Int64?, chunkSize: Int, maxChunks: Int) -> Int {
+        var filter = "id <= \(upToId)"
+        if let timestamp = timestamp { filter += " AND timestamp < \(timestamp)" }
+        remove(filter: filter, limit: nil)
+        return 0
+    }
+
     public func removeAll() {
         self.removeAll(completion: nil)
     }
