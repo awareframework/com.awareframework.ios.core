@@ -103,7 +103,7 @@ class DbSyncHelperIntegrationTests: XCTestCase {
         syncHelper.run { success, error in
             XCTAssertTrue(success)
             // Verify that the last uploaded ID was updated
-            let lastId = DbSyncUtils.getLastUploadedId(for: "sensor_data")
+            let lastId = DbSyncUtils.getLastUploadedId(forKey: self.syncHelper.markerKey)
             XCTAssertEqual(lastId, 100)
             expectation.fulfill()
         }

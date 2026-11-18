@@ -344,13 +344,43 @@ All settings can also be given as a dictionary with `DbSyncConfig(_:)` or `set(c
 
 `DbSyncHelper` uploads each table incrementally:
 
-1. **Progress is tracked by row ID.** Every table stores the ID of the last row uploaded successfully in `UserDefaults` (key `aware.sync.task.last_uploaded_id.<tableName>`). A sync sends rows with `id` greater than that value, in batches of `batchSize`, in ID order.
+1. **Progress is tracked by row ID.** Every table of every database stores the ID of the last row uploaded successfully in `UserDefaults` (see [Sync markers](#sync-markers)). A sync sends rows with `id` greater than that value, in batches of `batchSize`, in ID order.
 2. **Only HTTP 2xx counts as success.** The last uploaded ID advances (and, with `removeAfterSync`, the uploaded rows are deleted) only after the server answers with a 2xx status.
 3. **Failed rows are retried.** On a non-2xx status, a network error, or a timeout (30 s per request), the last uploaded ID does not change and the sync of that table stops. The same rows are sent again at the next sync. Nothing is lost while the server is down, and the backlog is sent in batches once it is back.
 4. **Uploaded rows are not sent again.** Rows at or below the last uploaded ID are never selected again, whether or not they are kept locally.
 5. **Delivery is at least once.** If the server stores a batch but the response does not reach the app (for example, the app is killed while waiting), that batch is sent again at the next sync. Servers should tolerate duplicates, for example by ignoring rows with the same `timestamp` and device ID.
+6. **One sync per table at a time.** When a sync is requested while another sync of the same table of the same database is running (for example, `DbSyncManager.sync()` followed by `sensor.sync(force: true)`), the running sync is not stopped. Stopping it would cancel a request that the server may already have stored, and its rows would be sent again. Instead, one more sync runs after the current one, however many requests were made meanwhile, and every completion handler is called. A sync with no activity for 330 s is treated as stopped, and the next request starts a new one.
 
-The last uploaded ID survives app restarts. Deleting the app, or the local database without its `UserDefaults` entry, resets it.
+The last uploaded ID survives app restarts. Deleting the app resets it.
+
+### Sync markers
+
+Each table of each database has its own marker. The key names the table and the database file, separated by a colon; the value is the ID of the last row uploaded (an integer):
+
+```
+aware.sync.task.last_uploaded_id.<tableName>:<database>
+aware.sync.task.last_uploaded_id.ios_battery:aware_battery.sqlite            => 5230
+aware.sync.task.last_uploaded_id.ios_battery_charge:aware_battery.sqlite     => 41
+aware.sync.task.last_uploaded_id.ios_locations:aware_locations.sqlite        => 1532
+```
+
+`<database>` is the database file name: `dbPath` with `.sqlite` added when it is missing, so `aware_battery` and `aware_battery.sqlite` are the same database. Two databases with the same table name (for example, one database per study) keep separate markers.
+
+Row IDs use AUTOINCREMENT and are never reused, even after rows are deleted. A marker larger than the largest ID the table ever assigned means that the database file was deleted and created again; the marker is then reset to 0, so the new rows are sent.
+
+#### Markers from 1.6.1 and earlier
+
+Up to 1.6.1 the key held only the table name (`aware.sync.task.last_uploaded_id.<tableName>`), so databases with the same table name shared one marker. On the first sync of each database, such a key is merged into the new format:
+
+| Situation at the first sync of a database | Result |
+|---|---|
+| An old marker exists, and it is not larger than any row ID this database ever assigned | Its value is moved into `<tableName>:<database>`, and the old key is deleted. Upload continues where it stopped |
+| An old marker exists, but it is larger than any row ID this database ever assigned | The old marker belongs to another database (for example, `dbPath` was renamed). This database starts from 0, and the old key is left for the database it belongs to |
+| No old marker | This database starts from 0 |
+
+Because the old key is deleted when it is moved, it is taken over by exactly one database. When two databases shared one marker before, the one that syncs first takes it over and the other starts from 0. Each move is logged (`[AWARE::Core] Moved sync marker ...`).
+
+When it is unclear which database a marker belongs to, the smaller value is chosen: rows may be sent again (servers should drop duplicates, as above), but no row is skipped. An app version from 1.6.1 or earlier installed again over a newer one (possible with TestFlight or development builds, not from the App Store) no longer finds the old key and sends its rows again.
 
 ---
 

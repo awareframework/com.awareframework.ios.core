@@ -68,13 +68,110 @@ struct DbSyncUtils {
     }
 
     /**
-     * Clear the ID of the last uploaded data for the specified table
+     * Clear every marker of the specified table: the marker from 1.6.1 and earlier, and the marker
+     * of each database.
      *
      * @param tableName Table name
      */
     static func clearLastUploadedId(for tableName: String) {
-        let key = "\(DbSyncConstants.userDefaultsKeyPrefix).\(tableName)"
-        UserDefaults.standard.removeObject(forKey: key)
+        let legacy = legacyKey(for: tableName)
+        let defaults = UserDefaults.standard
+        defaults.removeObject(forKey: legacy)
+        for key in defaults.dictionaryRepresentation().keys where key.hasPrefix("\(legacy):") {
+            defaults.removeObject(forKey: key)
+        }
+    }
+
+    // MARK: Marker per database
+    //
+    // Each table of each database has its own marker:
+    //   "<prefix>.<tableName>:<database>"   for example "...last_uploaded_id.ios_battery:aware_battery.sqlite"
+    // A colon separates the parts: it does not appear in table names, and unlike "/" it does not
+    // appear in a dbPath that points into a subfolder.
+    //
+    // Up to 1.6.1 the marker held only the table name ("<prefix>.<tableName>"). On the first sync of
+    // a database, such a marker is moved into the database's marker and then deleted (see
+    // `markerKey`), so that each old marker is taken over by exactly one database.
+
+    private static let markerLock = NSLock()
+
+    /// Marker key used up to 1.6.1 (table name only)
+    static func legacyKey(for tableName: String) -> String {
+        "\(DbSyncConstants.userDefaultsKeyPrefix).\(tableName)"
+    }
+
+    /// Marker key of a table in a database
+    static func databaseKey(for tableName: String, database: String) -> String {
+        "\(legacyKey(for: tableName)):\(database)"
+    }
+
+    /**
+     * Return the marker key of a table in a database, moving a marker from 1.6.1 and earlier into
+     * it on the database's first sync.
+     *
+     * - The database already has its marker: use it.
+     * - A marker from 1.6.1 or earlier is left, and it is not larger than any row ID this database
+     *   ever assigned: move its value into this database's marker and delete the old key. The old
+     *   value continues, and no other database can take it over afterwards.
+     * - The old marker is larger than any row ID this database ever assigned: it cannot belong to
+     *   this database (for example, `dbPath` was renamed). Start this database from 0 and leave the
+     *   old marker for the database it belongs to.
+     * - No marker at all: start from 0.
+     *
+     * When it is unclear which database an old marker belongs to, the smaller value is chosen:
+     * rows may be sent again (the server can drop duplicates), but no row is skipped.
+     *
+     * @param tableName Table name
+     * @param database Database identifier (`Engine.databaseIdentifier`)
+     * @param maxAssignedId Largest row ID ever assigned in the table, or nil if unknown
+     */
+    static func markerKey(for tableName: String, database: String, maxAssignedId: Int64?) -> String {
+        markerLock.lock()
+        defer { markerLock.unlock() }
+        let defaults = UserDefaults.standard
+        let key = databaseKey(for: tableName, database: database)
+        if defaults.object(forKey: key) != nil {
+            return key
+        }
+        let legacy = legacyKey(for: tableName)
+        var start: Int64 = 0
+        if defaults.object(forKey: legacy) != nil {
+            let old = Int64(defaults.integer(forKey: legacy))
+            if maxAssignedId.map({ old <= $0 }) ?? true {
+                start = old
+                defaults.removeObject(forKey: legacy)
+                print("[AWARE::Core] Moved sync marker \(legacy) = \(old) to \(key)")
+            } else {
+                print("[AWARE::Core] Sync marker \(legacy) = \(old) is larger than the last row ID "
+                      + "\(maxAssignedId ?? 0) of \(database); it belongs to another database. \(key) starts from 0")
+            }
+        }
+        defaults.set(start, forKey: key)
+        return key
+    }
+
+    static func getLastUploadedId(forKey key: String) -> Int64 {
+        Int64(UserDefaults.standard.integer(forKey: key))
+    }
+
+    /**
+     * Read the marker, and reset it to 0 when it is larger than any row ID the database ever
+     * assigned. Row IDs use AUTOINCREMENT and are never reused, so this happens only when the
+     * database file was deleted and created again; its rows start from 1 and none were sent yet.
+     */
+    static func validatedLastUploadedId(forKey key: String, maxAssignedId: Int64?) -> Int64 {
+        let value = getLastUploadedId(forKey: key)
+        if let maxId = maxAssignedId, value > maxId {
+            print("[AWARE::Core] Sync marker \(key) = \(value) is larger than the last row ID \(maxId); "
+                  + "the database was created again. The marker is reset to 0")
+            setLastUploadedId(0, forKey: key)
+            return 0
+        }
+        return value
+    }
+
+    static func setLastUploadedId(_ id: Int64, forKey key: String) {
+        UserDefaults.standard.setValue(id, forKey: key)
     }
 }
 
@@ -202,8 +299,17 @@ open class DbSyncHelper: NSObject {
     /// ID of the last uploaded data
     var lastUploadedId: Int64 = 0
 
+    /// UserDefaults key of the marker that belongs to this database's table (decided once per helper)
+    lazy var markerKey: String = DbSyncUtils.markerKey(
+        for: tableName, database: engine.databaseIdentifier,
+        maxAssignedId: engine.maxAssignedId(tableName: tableName))
+
     /// ID of the last data in current batch
     var idOfLastCandidate: Int64?
+
+    /// Time of the last sync activity (start of the sync or of a batch upload). Used by
+    /// `SQLiteEngine.startSync` to tell a sync that stopped responding from a long one.
+    var lastActivity: TimeInterval = Date().timeIntervalSince1970
 
     /// Current progress (0.0 - 1.0)
     var progress: Double = 0.0
@@ -419,6 +525,7 @@ open class DbSyncHelper: NSObject {
 
         resetRetryCounters()
         self.completion = completion
+        self.lastActivity = Date().timeIntervalSince1970
         self.isSessionActive = true
 
         if config.debug {
@@ -458,8 +565,9 @@ open class DbSyncHelper: NSObject {
             logVerbose("→ performDataSync() started")
         }
 
-        // Get previously synced ID
-        lastUploadedId = DbSyncUtils.getLastUploadedId(for: tableName)
+        // Get previously synced ID (from the marker that belongs to this database)
+        lastUploadedId = DbSyncUtils.validatedLastUploadedId(
+            forKey: markerKey, maxAssignedId: engine.maxAssignedId(tableName: tableName))
 
         if config.debug {
             logVerbose("→ performDataSync() lastUploadedId: \(lastUploadedId)")
@@ -796,6 +904,7 @@ open class DbSyncHelper: NSObject {
 
         // Record current batch size
         self.currentNumOfCandidates = candidates.count
+        self.lastActivity = Date().timeIntervalSince1970
 
         // Record ID of the last data (used when sync is completed)
         self.idOfLastCandidate = nil
@@ -1250,7 +1359,7 @@ open class DbSyncHelper: NSObject {
      */
     private func updateLastUploadedId() {
         if let candidateId = idOfLastCandidate {
-            DbSyncUtils.setLastUploadedId(candidateId, for: tableName)
+            DbSyncUtils.setLastUploadedId(candidateId, forKey: markerKey)
             idOfLastCandidate = nil
             if config.debug {
                 logVerbose(

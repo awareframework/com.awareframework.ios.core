@@ -122,6 +122,15 @@ open class Engine: EngineProtocal {
     open func stopSync() {}
 
     open func close() {}
+
+    /// Name that identifies this engine's database, used to tie a sync marker to its database.
+    open var databaseIdentifier: String {
+        config.path ?? "aware"
+    }
+
+    /// The largest row ID ever assigned in the table, or `nil` when the engine cannot tell.
+    /// Used to check that a sync marker belongs to this database.
+    open func maxAssignedId(tableName: String) -> Int64? { nil }
 }
 
 // MARK: - String hashing utilities

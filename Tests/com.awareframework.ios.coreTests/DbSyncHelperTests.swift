@@ -451,7 +451,7 @@ class DbSyncHelperTests: XCTestCase {
         awareServerHelper.run { success, error in
             XCTAssertTrue(success)
             XCTAssertNil(error)
-            XCTAssertEqual(DbSyncUtils.getLastUploadedId(for: tableName), 11)
+            XCTAssertEqual(DbSyncUtils.getLastUploadedId(forKey: awareServerHelper.markerKey), 11)
             expectation.fulfill()
         }
 
@@ -591,7 +591,7 @@ class DbSyncHelperTests: XCTestCase {
             XCTAssertNil(data?.first?["id"])
             XCTAssertEqual(data?.first?["deviceId"] as? String, "device-a")
             XCTAssertEqual(data?.first?["timestamp"] as? Int64, 1000)
-            XCTAssertEqual(DbSyncUtils.getLastUploadedId(for: tableName), 101)
+            XCTAssertEqual(DbSyncUtils.getLastUploadedId(forKey: awareLightHelper.markerKey), 101)
             expectation.fulfill()
         }
 
