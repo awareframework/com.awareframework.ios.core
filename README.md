@@ -21,15 +21,102 @@
 
 ## Installation
 
-Integrate this framework via Swift Package Manager (SwiftPM).
+All AWARE iOS packages are distributed via Swift Package Manager (SwiftPM). Every app needs this core package plus one package per sensor.
 
-1. Open **Package Dependencies** in Xcode:
-   `File` → `Add Package Dependencies...`
+| | |
+|---|---|
+| Requirements | iOS 13+ (also watchOS 7+, macOS 10.15+) |
+| Core package | `https://github.com/awareframework/com.awareframework.ios.core.git` |
+| Sensor packages | `https://github.com/awareframework/com.awareframework.ios.sensor.<name>.git` (e.g. `locations`, `accelerometer`, `esm`) |
+| Product (library) name | Same as the package name, e.g. `com.awareframework.ios.core`, `com.awareframework.ios.sensor.locations` |
+| Module to import | Same as the product name, e.g. `import com_awareframework_ios_core`. Swift replaces `.` with `_` in module names |
 
-2. Enter the repository URL:
-   `https://github.com/awareframework/com.awareframework.ios.core.git`
+Sensor packages depend on this core package, so SwiftPM resolves core automatically. Add core explicitly anyway when your code uses its types directly (`DbSyncManager`, `DbSyncConfig`, and so on), and keep all AWARE packages on compatible versions.
 
-3. Add the package to your target.
+### Option 1: Xcode
+
+1. Open `File` → `Add Package Dependencies...`.
+2. Enter a package URL from the table above and choose a version rule (e.g. *Up to Next Major Version*).
+3. Add the product to your app target.
+4. Repeat for each sensor package.
+
+### Option 2: `Package.swift`
+
+To use AWARE from your own Swift package:
+
+```swift
+// swift-tools-version:5.9
+import PackageDescription
+
+let package = Package(
+    name: "MyStudy",
+    platforms: [.iOS(.v13)],
+    dependencies: [
+        .package(url: "https://github.com/awareframework/com.awareframework.ios.core.git", from: "1.6.0"),
+        .package(url: "https://github.com/awareframework/com.awareframework.ios.sensor.locations.git", from: "1.6.1"),
+    ],
+    targets: [
+        .target(
+            name: "MyStudy",
+            dependencies: [
+                .product(name: "com.awareframework.ios.core", package: "com.awareframework.ios.core"),
+                .product(name: "com.awareframework.ios.sensor.locations", package: "com.awareframework.ios.sensor.locations"),
+            ]
+        ),
+    ]
+)
+```
+
+### Option 3: Command line (existing `.xcodeproj`, without the Xcode UI)
+
+This option is for CI and coding agents. Xcode has no command for adding a package to a `.xcodeproj`, so you need to edit `project.pbxproj` directly. Each package needs four entries. Object IDs must be unique 24-character hexadecimal strings; the IDs below are placeholders.
+
+```text
+/* 1. PBXBuildFile section: link the product in the Frameworks build phase */
+C0110000000000000000000A /* com.awareframework.ios.core in Frameworks */ = {isa = PBXBuildFile; productRef = C0210000000000000000000A /* com.awareframework.ios.core */; };
+
+/* 2. In the app target's PBXFrameworksBuildPhase `files`, and in the PBXNativeTarget */
+files = ( C0110000000000000000000A /* com.awareframework.ios.core in Frameworks */, );
+packageProductDependencies = ( C0210000000000000000000A /* com.awareframework.ios.core */, );
+
+/* 3. In the PBXProject object */
+packageReferences = ( C0310000000000000000000A /* XCRemoteSwiftPackageReference "com.awareframework.ios.core" */, );
+
+/* 4. New sections */
+/* Begin XCRemoteSwiftPackageReference section */
+C0310000000000000000000A /* XCRemoteSwiftPackageReference "com.awareframework.ios.core" */ = {
+    isa = XCRemoteSwiftPackageReference;
+    repositoryURL = "https://github.com/awareframework/com.awareframework.ios.core";
+    requirement = {
+        kind = upToNextMajorVersion;
+        minimumVersion = 1.6.0;
+    };
+};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+C0210000000000000000000A /* com.awareframework.ios.core */ = {
+    isa = XCSwiftPackageProductDependency;
+    package = C0310000000000000000000A /* XCRemoteSwiftPackageReference "com.awareframework.ios.core" */;
+    productName = com.awareframework.ios.core;
+};
+/* End XCSwiftPackageProductDependency section */
+```
+
+Repeat entries 1–4 for each sensor package with new IDs. To pin an exact version, use `kind = exactVersion; version = 1.6.0;`.
+
+### Verify the installation
+
+```sh
+xcodebuild -resolvePackageDependencies -project MyApp.xcodeproj -scheme MyApp
+xcodebuild -project MyApp.xcodeproj -scheme MyApp -sdk iphonesimulator build
+```
+
+The first command prints the resolved AWARE packages and their versions. Then confirm that `import com_awareframework_ios_core` compiles.
+
+### Permissions and capabilities
+
+The core package itself requires no Info.plist keys. Sensors that access protected resources do. For example, `com.awareframework.ios.sensor.locations` needs `NSLocationWhenInUseUsageDescription` and `NSLocationAlwaysAndWhenInUseUsageDescription`, plus the `location` background mode (`UIBackgroundModes`) to record in the background. See each sensor's README for the keys it needs, and add only those.
 
 ## Architecture
 
@@ -149,32 +236,121 @@ if let engine = sensor.dbEngine as? SQLiteEngine {
 
 ---
 
-## Server Types
+## Connecting to a Server
 
-| `ServerType` | Endpoint pattern |
+### Upload URL
+
+Each table is uploaded with HTTPS `POST` requests to a URL built from the server type, the host, the study number and the study key:
+
+| `ServerType` | Upload URL | Request body |
+|---|---|---|
+| `.aware_micro` | `https://{host}/api/{studyNumber}/{studyKey}/insert/` | JSON |
+| `.aware_light` | `https://{host}/insert/` (`id` is removed from each row) | JSON |
+| `.aware` | `https://{host}/index.php/webservice/index/{studyNumber}/{studyKey}/{tableName}/insert` | form (`device_id`, `data`) |
+| `.none` | No remote sync | — |
+
+- `host` is the host name with an optional port, e.g. `aware.example.com` or `localhost:8443`. A leading `http://` or `https://` is removed, and requests always use HTTPS.
+- The study key and the table name are percent-encoded in the path.
+- TLS certificate validation stays on. Use a certificate the device trusts.
+
+### Setting the host, study number and study key
+
+The **host** is set per sensor, with `SensorConfig.dbHost`. Sync does not start for a sensor whose `dbHost` is `nil`.
+
+Sensor packages build their own `DbSyncConfig` for each table, and the **study number, study key and server type** of that config come from the static defaults on `DbSyncConfig`. Set them once at launch, before starting the sensors:
+
+```swift
+import com_awareframework_ios_core
+import com_awareframework_ios_sensor_locations
+
+// 1. Study (read by every sensor's sync)
+DbSyncConfig.defaultServerType  = .aware_micro
+DbSyncConfig.defaultStudyNumber = 1
+DbSyncConfig.defaultStudyKey    = "my-study-key"
+
+// 2. Host (per sensor). Setting the same values on the sensor config keeps them consistent.
+let locations = LocationsSensor(LocationsSensor.Config().apply { c in
+    c.dbHost      = "aware.example.com"
+    c.serverType  = .aware_micro
+    c.studyNumber = 1
+    c.studyKey    = "my-study-key"
+})
+locations.start()
+```
+
+---
+
+## DbSyncManager Reference
+
+`DbSyncManager` triggers sync on a timer. Each tick posts a sync request (`Notification.Name.Aware.dbSyncRequest`) unless a guard below blocks it, and every **enabled** sensor uploads its tables. A sensor is enabled with `sensor.enable()` or `SensorManager.shared.enableAllSensors()`; `start()` alone does not enable sync.
+
+| Setting (`DbSyncManagerConfig`) | Builder method | Default | Description |
+|---|---|---|---|
+| `syncInterval: Double` | `setSyncInterval(_ minutes:)` | `1.0` | Interval between syncs, in **minutes**. Values ≤ 0 are ignored. |
+| `wifiOnly: Bool` | `setWifiOnly(_:)` | `true` | Skip a tick when the connection is cellular or unavailable. |
+| `batteryChargingOnly: Bool` | `setBatteryOnly(_:)` | `false` | Skip a tick unless the device is charging or full. |
+| `debug: Bool` | — | `false` | Enable debug logging. |
+| `debugLevel: DbSyncDebugLevel` | — | `.info` | Log verbosity. |
+| `sensors: [AwareSensor]` | `addSensor(_:)`, `addSensors(_:)`, `remove(_:)` | `[]` | Sensors registered with the manager. |
+
+| Method | Description |
 |---|---|
-| `.aware` | Legacy AWARE PHP server (`/index.php/webservice/…`) |
-| `.aware_micro` | AWARE Micro server (`/api/{studyNumber}/{studyKey}/insert/`) |
-| `.aware_light` | AWARE Light server (`/insert/`), strips `id` from payload |
-| `.none` | No remote sync |
+| `start()` | Starts the timer. The first sync happens after one interval, not immediately. |
+| `stop()` | Stops the timer. |
+| `sync(_ force: Bool = false)` | Requests a sync now. `force: true` ignores `wifiOnly` and `batteryChargingOnly`. |
+
+```swift
+let syncManager = DbSyncManager.Builder()
+    .setSyncInterval(30)     // every 30 minutes
+    .setWifiOnly(true)
+    .build()
+SensorManager.shared.addSensor(locations)
+SensorManager.shared.enableAllSensors()   // subscribe the sensors to sync requests
+syncManager.start()
+
+// Upload immediately, regardless of the network type
+SensorManager.shared.syncAllSensors(force: true)
+```
 
 ---
 
 ## DbSyncConfig Reference
 
-+ `batchSize: Int`: Records per upload batch. (default = `1000`)
-+ `removeAfterSync: Bool`: Delete local records after successful upload. (default = `false`)
-+ `compactDataFormat: Bool`: Aggregate columns into arrays to reduce payload size. (default = `false`)
-+ `backgroundSession: Bool`: Use `URLSessionConfiguration.background`. (default = `false`)
-+ `serverType: ServerType`: Target server protocol. (default = `.aware_micro`)
-+ `studyNumber: Int`: Study number embedded in upload URL. (default = `1`)
-+ `studyKey: String`: Study key embedded in upload URL. (default = `""`)
-+ `debug: Bool`: Enable debug logging. (default = `false`)
-+ `debugLevel: DbSyncDebugLevel`: Log verbosity: `.none`, `.error`, `.warning`, `.info`, `.verbose`, `.trace`. (default = `.info`)
-+ `test: Bool`: Skip real network calls (unit test mode). (default = `false`)
-+ `progressHandler: closure`: Called with `(Double, Error?)` during upload. (default = `nil`)
-+ `completionHandler: closure`: Called with `(Bool, Error?)` on finish. (default = `nil`)
-+ `dispatchQueue: DispatchQueue?`: Queue on which to run next-batch calls. (default = `nil`)
+Per-table upload settings, used by `DbSyncHelper`.
+
+| Setting | Default | Description |
+|---|---|---|
+| `serverType: ServerType` | `DbSyncConfig.defaultServerType` (`.aware_micro`) | Server protocol; selects the upload URL (see [Upload URL](#upload-url)). |
+| `studyNumber: Int` | `DbSyncConfig.defaultStudyNumber` (`1`) | Study number in the upload URL. |
+| `studyKey: String` | `DbSyncConfig.defaultStudyKey` (`""`) | Study key in the upload URL. |
+| `batchSize: Int` | `1000` | Rows per upload request. Larger backlogs are sent in several requests in one sync. |
+| `removeAfterSync: Bool` | `false` | Delete rows from the local database after they are uploaded successfully. |
+| `compactDataFormat: Bool` | `DbSyncConfig.defaultCompactDataFormat` (`false`) | Send columns as arrays, and omit `os`, `jsonVersion`, `deviceId` and `timezone`, to reduce payload size. |
+| `backgroundSession: Bool` | `false` | Use a background `URLSession` (`URLSessionConfiguration.background`). |
+| `debug: Bool` | `false` | Enable debug logging. |
+| `debugLevel: DbSyncDebugLevel` | `.info` | Log verbosity: `.none`, `.error`, `.warning`, `.info`, `.verbose`, `.trace`. |
+| `progressHandler: (Double, Error?) -> Void` | `nil` | Called during upload with progress from 0.0 to 1.0. |
+| `completionHandler: (Bool, Error?) -> Void` | `nil` | Called when the sync of the table finishes. |
+| `dispatchQueue: DispatchQueue?` | `nil` | Queue on which the next batch is scheduled. |
+| `test: Bool` | `false` | Skip network calls and treat each batch as uploaded (unit tests only). |
+| `markAsSynced`, `skipSyncedData`, `keepLastData: Bool` | `false` | Reserved. `DbSyncHelper` does not currently use them. Use `removeAfterSync` to delete uploaded rows. |
+| `deviceId: String?` | `nil` | Reserved. Rows carry the device ID from `SensorConfig.deviceId`. |
+
+All settings can also be given as a dictionary with `DbSyncConfig(_:)` or `set(config:)`, e.g. `["batchSize": 500, "studyKey": "my-study-key"]`.
+
+---
+
+## Sync Guarantees
+
+`DbSyncHelper` uploads each table incrementally:
+
+1. **Progress is tracked by row ID.** Every table stores the ID of the last row uploaded successfully in `UserDefaults` (key `aware.sync.task.last_uploaded_id.<tableName>`). A sync sends rows with `id` greater than that value, in batches of `batchSize`, in ID order.
+2. **Only HTTP 2xx counts as success.** The last uploaded ID advances (and, with `removeAfterSync`, the uploaded rows are deleted) only after the server answers with a 2xx status.
+3. **Failed rows are retried.** On a non-2xx status, a network error, or a timeout (30 s per request), the last uploaded ID does not change and the sync of that table stops. The same rows are sent again at the next sync. Nothing is lost while the server is down, and the backlog is sent in batches once it is back.
+4. **Uploaded rows are not sent again.** Rows at or below the last uploaded ID are never selected again, whether or not they are kept locally.
+5. **Delivery is at least once.** If the server stores a batch but the response does not reach the app (for example, the app is killed while waiting), that batch is sent again at the next sync. Servers should tolerate duplicates, for example by ignoring rows with the same `timestamp` and device ID.
+
+The last uploaded ID survives app restarts. Deleting the app, or the local database without its `UserDefaults` entry, resets it.
 
 ---
 
