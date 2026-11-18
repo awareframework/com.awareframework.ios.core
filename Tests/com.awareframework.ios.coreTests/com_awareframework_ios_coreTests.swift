@@ -391,6 +391,43 @@ class UnitTests: XCTestCase {
         XCTAssertNoThrow(try SQLiteEngine.createParentDirectory(ofDatabaseAt: path))
     }
 
+    /// `fetch` returns rows in ID order even when SQLite returns unordered rows in another order.
+    /// `PRAGMA reverse_unordered_selects` makes SQLite reverse every SELECT without ORDER BY.
+    func testFetchReturnsRowsInIdOrder() throws {
+        guard let engine = makeEmptySQLiteEngine("fetch_order_test"), let queue = engine.getSQLiteInstance() else {
+            return XCTFail("SQLite engine is not available")
+        }
+        engine.save((0..<10).map { i in sample(at: Int64(1_000 + i)) } as [any BaseDbModelSQLite])
+        let all = ids(engine)
+        try queue.writeWithoutTransaction { db in try db.execute(sql: "PRAGMA reverse_unordered_selects = ON") }
+        defer {
+            try? queue.writeWithoutTransaction { db in try db.execute(sql: "PRAGMA reverse_unordered_selects = OFF") }
+            engine.removeAll()
+        }
+
+        // The sync's query: the next batch must be the lowest IDs above the marker, in order
+        let batch = (engine.fetch(filter: "id > \(all[1])", limit: 3) ?? []).compactMap { $0["id"] as? Int64 }
+        XCTAssertEqual(batch, Array(all[2...4]))
+        let first = (engine.fetch(filter: nil, limit: 2) ?? []).compactMap { $0["id"] as? Int64 }
+        XCTAssertEqual(first, Array(all[0...1]))
+
+        // A filter with its own ORDER BY keeps it (no second ORDER BY is added)
+        let latest = (engine.fetch(filter: "timestamp >= 1003 ORDER BY timestamp DESC", limit: 2) ?? [])
+            .compactMap { $0["timestamp"] as? Int64 }
+        XCTAssertEqual(latest, [1009, 1008])
+        let lowercase = (engine.fetch(filter: "timestamp >= 0 order  by timestamp desc", limit: 1) ?? [])
+            .compactMap { $0["timestamp"] as? Int64 }
+        XCTAssertEqual(lowercase, [1009])
+    }
+
+    func testContainsOrderBy() {
+        XCTAssertFalse(SQLiteEngine.containsOrderBy(nil))
+        XCTAssertFalse(SQLiteEngine.containsOrderBy("id > 10"))
+        XCTAssertFalse(SQLiteEngine.containsOrderBy("label = 'border'"))
+        XCTAssertTrue(SQLiteEngine.containsOrderBy("timestamp >= 0 ORDER BY timestamp DESC"))
+        XCTAssertTrue(SQLiteEngine.containsOrderBy("id > 0 order\nby id"))
+    }
+
     /// Makes a SQLite engine with an empty table `A` in its own database file.
     private func makeEmptySQLiteEngine(_ dbPath: String) -> SQLiteEngine? {
         let sensor = AwareSensor()
