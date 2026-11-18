@@ -218,6 +218,7 @@ open class SQLiteEngine: Engine {
         do {
             var sql = "SELECT * FROM \(tableName)"
             if let f = filter { sql += " WHERE \(f)" }
+            if !Self.containsOrderBy(filter) { sql += " ORDER BY rowid" }
             if let l = limit { sql += " LIMIT \(l)" }
             return try Self.retryLockedDatabaseWork {
                 try db.read { db in
@@ -242,6 +243,19 @@ open class SQLiteEngine: Engine {
         completion: (([[String: Any]]?, Error?) -> Void)?
     ) {
         completion?(fetch(filter: filter, limit: limit), nil)
+    }
+
+    /// Whether a `filter` already orders the rows (e.g. `"timestamp >= 0 ORDER BY timestamp DESC"`).
+    ///
+    /// Without its own `ORDER BY`, `fetch` returns rows in row ID order (`ORDER BY rowid`; `id` is the
+    /// rowid). SQL does not define the order of rows without `ORDER BY`. The sync reads
+    /// `id > lastUploadedId` with `LIMIT batchSize` and moves its marker, and deletes rows, up to the
+    /// last row it read, so it needs the batch to be the lowest IDs in order: in any other order,
+    /// rows that were not uploaded would be skipped or deleted. A range search on the rowid already
+    /// returns rows in that order, so `ORDER BY rowid` adds no sort.
+    static func containsOrderBy(_ filter: String?) -> Bool {
+        guard let filter else { return false }
+        return filter.range(of: #"\border\s+by\b"#, options: [.regularExpression, .caseInsensitive]) != nil
     }
 
     // MARK: - Remove

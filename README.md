@@ -349,7 +349,7 @@ All settings can also be given as a dictionary with `DbSyncConfig(_:)` or `set(c
 
 `DbSyncHelper` uploads each table incrementally:
 
-1. **Progress is tracked by row ID.** Every table of every database stores the ID of the last row uploaded successfully in `UserDefaults` (see [Sync markers](#sync-markers)). A sync sends rows with `id` greater than that value, in batches of `batchSize`, in ID order.
+1. **Progress is tracked by row ID.** Every table of every database stores the ID of the last row uploaded successfully in `UserDefaults` (see [Sync markers](#sync-markers)). A sync sends rows with `id` greater than that value, in batches of `batchSize`, in ID order. `Engine.fetch(filter:limit:)` returns rows in row ID order (`ORDER BY rowid`) unless the filter has its own `ORDER BY`, so each batch is the lowest IDs above the marker whatever query plan SQLite chooses.
 2. **Only HTTP 2xx counts as success.** The last uploaded ID advances (and, with `removeAfterSync`, uploaded rows older than `keepDataAfterSync` are deleted) only after the server answers with a 2xx status.
 3. **Failed rows are retried.** On a non-2xx status, a network error, or a timeout (30 s per request), the last uploaded ID does not change and the sync of that table stops. The same rows are sent again at the next sync. Nothing is lost while the server is down, and the backlog is sent in batches once it is back.
 4. **Uploaded rows are not sent again.** Rows at or below the last uploaded ID are never selected again, whether or not they are kept locally.
