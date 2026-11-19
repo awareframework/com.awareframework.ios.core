@@ -417,6 +417,20 @@ Because the old key is deleted when it is moved, it is taken over by exactly one
 
 When it is unclear which database a marker belongs to, the smaller value is chosen: rows may be sent again (servers should drop duplicates, as above), but no row is skipped. An app version from 1.6.1 or earlier installed again over a newer one (possible with TestFlight or development builds, not from the App Store) no longer finds the old key and sends its rows again.
 
+#### Moving a table to another database file
+
+When a sensor's default `dbPath` changes, `SQLiteEngine.moveTable(_:fromDatabaseAt:)` moves the rows still waiting for upload from the old file, so that they are not left behind:
+
+```swift
+// In the sensor, after its table is created in the new database
+(dbEngine as? SQLiteEngine)?.moveTable(GyroscopeData.databaseTableName, fromDatabaseAt: "aware")
+```
+
+- Only rows above the old database's marker move (uploaded rows stay out), in order, with new IDs after the rows the table already has. The next sync sends them.
+- The old table is dropped and its marker removed. A marker from 1.6.1 or earlier is taken over by the old database first, so the new database never skips moved rows.
+- The copy and the drop are one transaction in the new database. If the app stops before the old file is updated, the next call copies the rows again: the server may receive them twice, but none is lost.
+- It does nothing when the old file or table does not exist, so it can be called at every launch.
+
 ---
 
 ## SQLiteEngine Utilities

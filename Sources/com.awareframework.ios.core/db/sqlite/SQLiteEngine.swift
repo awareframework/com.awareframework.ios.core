@@ -542,6 +542,85 @@ open class SQLiteEngine: Engine {
         try getAllTableNames(in: db).contains(tableName)
     }
 
+    // MARK: - Moving a table from another database file
+
+    /**
+     * Moves a table's rows that were not uploaded yet from the database at `oldPath` into this
+     * engine's database, then drops the table in the old database.
+     *
+     * For a sensor whose default `dbPath` changed: without this, the rows still waiting in the old
+     * file would never be uploaded. The table must already exist in this database. Rows keep their
+     * order and get new IDs here, after any rows this table already has, so they are uploaded by the
+     * next sync. Rows at or below the old database's sync marker were uploaded already and are not
+     * moved; the old marker is removed.
+     *
+     * The copy and the drop are one transaction in this database. If the app stops between the
+     * commit here and in the old file, the next call copies the rows again: the server may receive
+     * them twice, but none is lost.
+     *
+     * - Parameters:
+     *   - tableName: The table, with the same name in both databases.
+     *   - oldPath: The old `dbPath` (for example `"aware"` for `aware.sqlite`).
+     * - Returns: The number of rows moved (0 when the old file or table does not exist).
+     */
+    @discardableResult
+    public func moveTable(_ tableName: String, fromDatabaseAt oldPath: String) -> Int {
+        guard let path = config.path, let queue = getSQLiteInstance() else { return 0 }
+        let oldURL = Self.fileURL(for: oldPath)
+        guard Self.sqliteFileName(for: oldPath) != Self.sqliteFileName(for: path),
+              FileManager.default.fileExists(atPath: oldURL.path) else { return 0 }
+
+        let oldConfig = EngineConfig()
+        oldConfig.path = oldPath
+        oldConfig.tableName = tableName
+        let old = SQLiteEngine(oldConfig)
+        guard let oldQueue = old.getSQLiteInstance(),
+              (try? hasTable(tableName, in: oldQueue)) == true else { return 0 }
+
+        // The old database's marker first: it takes over a marker from 1.6.1 or earlier, so that
+        // marker cannot be given to this database (whose new row IDs it does not describe)
+        let oldMax = old.maxAssignedId(tableName: tableName)
+        let oldKey = DbSyncUtils.markerKey(for: tableName, database: old.databaseIdentifier, maxAssignedId: oldMax)
+        let uploaded = DbSyncUtils.validatedLastUploadedId(forKey: oldKey, maxAssignedId: oldMax)
+        _ = DbSyncUtils.markerKey(for: tableName, database: databaseIdentifier,
+                                  maxAssignedId: maxAssignedId(tableName: tableName))
+
+        do {
+            let moved = try Self.retryLockedDatabaseWork {
+                try queue.writeWithoutTransaction { db -> Int in
+                    try db.execute(sql: "PRAGMA busy_timeout = 10000")
+                    try db.execute(sql: "ATTACH DATABASE ? AS moved_from", arguments: [oldURL.path])
+                    defer { try? db.execute(sql: "DETACH DATABASE moved_from") }
+                    var count = 0
+                    try db.inTransaction {
+                        let columns = { (schema: String) throws -> [String] in
+                            try Row.fetchAll(db, sql: "PRAGMA \(schema).table_info(\(tableName))")
+                                .compactMap { $0["name"] as? String }
+                        }
+                        let here = Set(try columns("main"))
+                        let shared = try columns("moved_from").filter { $0 != "id" && here.contains($0) }
+                        if !shared.isEmpty {
+                            let list = shared.map { "\"\($0)\"" }.joined(separator: ", ")
+                            try db.execute(
+                                sql: "INSERT INTO main.\(tableName) (\(list)) SELECT \(list) FROM moved_from.\(tableName) WHERE id > ? ORDER BY id",
+                                arguments: [uploaded])
+                            count = db.changesCount
+                        }
+                        try db.execute(sql: "DROP TABLE moved_from.\(tableName)")
+                        return .commit
+                    }
+                    return count
+                }
+            }
+            UserDefaults.standard.removeObject(forKey: oldKey)
+            print("[AWARE::Core] Moved \(moved) rows of \(tableName) from \(old.databaseIdentifier) to \(databaseIdentifier)")
+            return moved
+        } catch {
+            print("[Error][SQLiteEngine] Moving \(tableName) from \(old.databaseIdentifier) failed: \(error)")
+            return 0
+        }
+    }
+
     public func getAllTableNames() throws -> [String] {
         guard let db = getSQLiteInstance() else {
             return []
