@@ -238,6 +238,65 @@ open class SQLiteEngine: Engine {
         }
     }
 
+    /// Upload rows written as JSON straight from the SQLite values, without a dictionary per row.
+    /// See `Engine.fetchUploadJSON(afterId:limit:omitting:)`.
+    public override func fetchUploadJSON(afterId: Int64, limit: Int, omitting: Set<String>) -> [UploadRowJSON]? {
+        guard let tableName = config.tableName,
+            let db = getSQLiteInstance()
+        else { return nil }
+        let sql = "SELECT * FROM \(tableName) WHERE id > ? ORDER BY rowid LIMIT ?"
+        do {
+            return try Self.retryLockedDatabaseWork {
+                try db.read { db -> [UploadRowJSON]? in
+                    let cursor = try Row.fetchCursor(db, sql: sql, arguments: [afterId, max(0, limit)])
+                    var results: [UploadRowJSON] = []
+                    results.reserveCapacity(max(0, limit))
+                    var json = ""
+                    while let row = try cursor.next() {
+                        var id: Int64?
+                        var valid = true
+                        json.removeAll(keepingCapacity: true)
+                        json.append("{")
+                        var first = true
+                        for (column, value) in row {
+                            if column == "id", case .int64(let v) = value.storage { id = v }
+                            if omitting.contains(column) { continue }
+                            switch value.storage {
+                            case .null:
+                                continue  // fetch(filter:limit:) leaves NULL columns out of the row
+                            case .blob:
+                                valid = false
+                            case .int64(let v):
+                                if !first { json.append(",") }
+                                UploadJSONWriter.appendKey(column, to: &json)
+                                json.append(String(v))
+                            case .double(let v):
+                                if !first { json.append(",") }
+                                UploadJSONWriter.appendKey(column, to: &json)
+                                valid = UploadJSONWriter.appendDouble(v, to: &json) && valid
+                            case .string(let v):
+                                if !first { json.append(",") }
+                                UploadJSONWriter.appendKey(column, to: &json)
+                                UploadJSONWriter.appendString(v, to: &json)
+                            }
+                            first = false
+                            if !valid { break }
+                        }
+                        // Rows without an integer id cannot be tracked by the sync marker
+                        guard let rowId = id else { return nil }
+                        json.append("}")
+                        results.append(UploadRowJSON(id: rowId, json: valid ? String(json) : nil))
+                        if !valid { break }
+                    }
+                    return results
+                }
+            }
+        } catch {
+            print("[Error][SQLiteEngine] fetchUploadJSON failed: \(error)")
+            return nil
+        }
+    }
+
     public override func fetch(
         filter: String? = nil, limit: Int? = nil,
         completion: (([[String: Any]]?, Error?) -> Void)?

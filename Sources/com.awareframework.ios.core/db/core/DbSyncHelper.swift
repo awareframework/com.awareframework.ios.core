@@ -27,7 +27,6 @@ private struct DbSyncConstants {
 
     // Retry and delay values
     static let retryDelay: TimeInterval = 1.0
-    static let nextBatchDelay: TimeInterval = 0.1
 
     // HTTP Status codes
     static let httpSuccessRange = 200..<300
@@ -243,6 +242,42 @@ open class DbSyncHelper: NSObject {
     /// Flag indicating whether this is the last batch
     private var isLastBatch = false
 
+    // MARK: Sync queue and pacing
+
+    /// Serial queue for all sync work: reading rows, building requests, the URLSession callbacks and
+    /// deleting uploaded rows. Nothing runs on the main thread, so a sync never blocks the UI.
+    private let syncQueue: DispatchQueue
+
+    /// URLSession delegate callbacks run on `syncQueue`, so the sync state is used from one queue
+    private let delegateQueue: OperationQueue
+
+    /// CPU-bound time of the current batch (reading rows, building the body, deleting rows).
+    /// The sync rests for a multiple of it before the next batch (`SyncPacing`).
+    private var batchWorkSeconds: TimeInterval = 0
+
+    /// Size of the request body being sent, for adjusting the size limit after a 413 or a timeout
+    private var currentBodyBytes = 0
+
+    /// HTTP status and Retry-After of the last response
+    private var lastStatusCode: Int?
+    private var lastRetryAfter: TimeInterval?
+
+    /// Retries in a row after 413, a timeout, 429 or 503 (reset by a successful request)
+    private var adjustRetries = 0
+
+    /// Host key for the learned request size limit
+    private var limitHost: String { AwareUtils.cleanHostName(host) }
+
+    /// Run `work` on the sync queue, with a lower priority while the app is in the background
+    private func onSyncQueue(after delay: TimeInterval = 0, _ work: @escaping () -> Void) {
+        let item = DispatchWorkItem(qos: SyncAppState.shared.workQoS, flags: .enforceQoS, block: work)
+        if delay > 0 {
+            syncQueue.asyncAfter(deadline: .now() + delay, execute: item)
+        } else {
+            syncQueue.async(execute: item)
+        }
+    }
+
     /// Property indicating whether session is active (for improved state management convenience)
     private var isSessionActive: Bool {
         get {
@@ -347,6 +382,13 @@ open class DbSyncHelper: NSObject {
         self.host = host.trimmingCharacters(in: .whitespacesAndNewlines)
         self.tableName = tableName.trimmingCharacters(in: .whitespacesAndNewlines)
         self.config = config
+        // Release temporary objects (JSON data of each row, fetched rows) after each work item;
+        // otherwise they pile up while a large backlog is sent
+        self.syncQueue = DispatchQueue(label: "com.aware.sync.\(self.tableName)", qos: .utility,
+                                       autoreleaseFrequency: .workItem)
+        self.delegateQueue = OperationQueue()
+        self.delegateQueue.maxConcurrentOperationCount = 1
+        self.delegateQueue.underlyingQueue = self.syncQueue
         super.init()
     }
 
@@ -532,7 +574,7 @@ open class DbSyncHelper: NSObject {
             logVerbose("→ startSyncProcess() set session active, dispatching to background queue")
         }
 
-        sessionQueue.async { [weak self] in
+        onSyncQueue { [weak self] in
             self?.executeSyncWorkflow()
         }
 
@@ -585,22 +627,190 @@ open class DbSyncHelper: NSObject {
             }
         }
 
-        // Get target data for synchronization
-        let candidates = getUploadCandidates(
-            lastUploadedId: lastUploadedId, limit: config.batchSize)
+        // Choose the rows of this request: as many as fit in the size limit (on the sync queue)
+        let started = Date()
+        let batch = selectBatch()
+        batchWorkSeconds = Date().timeIntervalSince(started)
 
         if config.debug {
             logVerbose(
-                "→ performDataSync() found \(candidates.count) candidates, dispatching to upload")
+                "→ performDataSync() selected \(batch.count) rows"
+                + (batch.body.map { " (\($0.utf8.count) bytes)" } ?? "") + ", last batch: \(batch.isLast)")
         }
 
-        // Start upload process on main thread
-        DispatchQueue.main.async {
-            self.logVerbose("calling upload() on main thread")
-            self.upload(candidates)
-        }
+        send(count: batch.count, lastId: batch.lastId, rows: batch.rows, body: batch.body, isLast: batch.isLast)
 
         logTrace("performDataSync() completed")
+    }
+
+    // MARK: - Request size
+
+    private struct Batch {
+        var count: Int
+        var lastId: Int64?
+        /// The rows, kept only when the body is built by `buildRequestBody(from:)`
+        var rows: [[String: Any]]?
+        /// The request body, or nil when it is built by `buildRequestBody(from:)`
+        var body: String?
+        var isLast: Bool
+    }
+
+    /// Choose the rows of the next request.
+    ///
+    /// Rows are read `batchSize` at a time, in row ID order, and added while the request body stays
+    /// within the size limit (`SyncBatchLimit`) and `maxBatchRows`. Each row is turned into JSON once;
+    /// its size is measured in the form the body uses (JSON, or URL-encoded for the legacy AWARE server),
+    /// and the JSON is reused for the body. Only the JSON is kept, not the rows, so memory stays near
+    /// the size of the body. The first row is always taken, so a sync makes progress.
+    ///
+    /// With `compactDataFormat` or `createHttpRequestBodyHandler` the body is not the sum of its rows,
+    /// so it is built with `buildRequestBody(from:)` and rows are removed until it fits.
+    private func selectBatch() -> Batch {
+        let limit = SyncBatchLimit.current(host: limitHost, config: config)
+        let maxRows = max(1, config.maxBatchRows)
+        let chunk = max(1, min(config.batchSize, maxRows))
+        let form = !usesNewAwareServerEndpoint
+        let separator = form ? formEncodedLength(",") : 1
+        let exact = !config.compactDataFormat && createHttpRequestBodyHandler == nil
+
+        var rows: [[String: Any]] = []   // only when !exact
+        var pieces: [String] = []
+        var count = 0
+        var lastId: Int64?
+        var total = 0
+        if exact {
+            // Size with no rows: the envelope with an empty data array (see assembleBody)
+            total = form ? formEnvelopeLength() : jsonEnvelope().utf8.count + ",\"data\":[]".utf8.count
+        }
+        var afterId = lastUploadedId
+        var more = true
+        var invalid = false
+
+        reading: while count < maxRows {
+            let want = min(chunk, maxRows - count)
+            var stop = false
+            let fetchedCount: Int = autoreleasepool {
+                // Fast path: the engine writes each row's JSON without a dictionary per row
+                if exact, let encoded = getUploadCandidateJSON(lastUploadedId: afterId, limit: want) {
+                    for row in encoded {
+                        guard let json = row.json else {
+                            invalid = true
+                            stop = true
+                            break
+                        }
+                        let size = (form ? formEncodedLength(json) : json.utf8.count) + (pieces.isEmpty ? 0 : separator)
+                        if count > 0 && total + size > limit {
+                            stop = true
+                            break
+                        }
+                        pieces.append(json)
+                        total += size
+                        count += 1
+                        lastId = row.id
+                    }
+                    return encoded.count
+                }
+                let fetched = getUploadCandidates(lastUploadedId: afterId, limit: want)
+                for row in fetched {
+                    if !exact {
+                        rows.append(row)
+                    } else if let json = rowJSON(row) {
+                        let size = (form ? formEncodedLength(json) : json.utf8.count) + (pieces.isEmpty ? 0 : separator)
+                        if count > 0 && total + size > limit {
+                            stop = true
+                            break
+                        }
+                        pieces.append(json)
+                        total += size
+                    } else {
+                        // Not valid JSON: fall back to buildRequestBody, which reports the error
+                        invalid = true
+                        stop = true
+                        break
+                    }
+                    count += 1
+                    lastId = row["id"] as? Int64
+                }
+                return fetched.count
+            }
+            if invalid { break }
+            if stop { more = true; break reading }
+            if fetchedCount == 0 { more = false; break }
+            guard fetchedCount == want, let id = lastId else {
+                more = fetchedCount == want
+                break
+            }
+            afterId = id
+        }
+
+        if exact && !invalid {
+            return Batch(count: count, lastId: lastId, rows: nil, body: assembleBody(pieces, form: form), isLast: !more)
+        }
+        if invalid {
+            // Read the same rows again as dictionaries for buildRequestBody
+            rows = getUploadCandidates(lastUploadedId: lastUploadedId, limit: min(chunk, maxRows))
+            more = true
+        }
+        // Build with the general builder, and remove rows until the body fits
+        for _ in 0..<4 {
+            guard rows.count > 1, let body = try? buildRequestBody(from: rows) else { break }
+            let bytes = body.utf8.count
+            if bytes <= limit { break }
+            let keep = max(1, Int(Double(rows.count) * Double(limit) / Double(bytes) * 0.95))
+            rows = Array(rows.prefix(keep))
+            more = true
+        }
+        return Batch(count: rows.count, lastId: rows.last?["id"] as? Int64, rows: rows, body: nil, isLast: !more)
+    }
+
+    /// A row as it is uploaded, in JSON (nil if it cannot be turned into JSON)
+    private func rowJSON(_ row: [String: Any]) -> String? {
+        var upload = row
+        if config.serverType == .aware_light { upload.removeValue(forKey: "id") }
+        guard JSONSerialization.isValidJSONObject(upload),
+              let data = try? JSONSerialization.data(withJSONObject: upload, options: []) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    /// `{"deviceId":...,"tableName":...,"timestamp":...}` for the JSON body (AWARE Micro, AWARE Light)
+    private func jsonEnvelope() -> String {
+        let params: [String: Any] = [
+            "deviceId": AwareUtils.getCommonDeviceId(),
+            "tableName": tableName,
+            "timestamp": Int64(Date().timeIntervalSince1970 * 1000),
+        ]
+        let data = (try? JSONSerialization.data(withJSONObject: params, options: [])) ?? Data("{}".utf8)
+        return String(data: data, encoding: .utf8) ?? "{}"
+    }
+
+    /// Length of the form body with an empty data array (legacy AWARE server)
+    private func formEnvelopeLength() -> Int {
+        buildFormRequestBody(["device_id": AwareUtils.getCommonDeviceId(), "data": "[]"]).utf8.count
+    }
+
+    /// Length of `text` after URL encoding as a form value. Encoding is per character, so the encoded
+    /// lengths of the rows add up to the encoded length of the data array.
+    private func formEncodedLength(_ text: String) -> Int {
+        buildFormRequestBody(["v": text]).utf8.count - "v=".utf8.count
+    }
+
+    /// The request body from the rows' JSON, in the same form `buildRequestBody(from:)` produces
+    private func assembleBody(_ pieces: [String], form: Bool) -> String {
+        if form {
+            let data = "[" + pieces.joined(separator: ",") + "]"
+            return buildFormRequestBody(["device_id": AwareUtils.getCommonDeviceId(), "data": data])
+        }
+        // One buffer of the final size, instead of joining and then concatenating copies
+        let head = String(jsonEnvelope().dropLast()) + ",\"data\":["
+        var body = ""
+        body.reserveCapacity(head.utf8.count + pieces.reduce(0) { $0 + $1.utf8.count } + pieces.count + 2)
+        body.append(head)
+        for (i, piece) in pieces.enumerated() {
+            if i > 0 { body.append(",") }
+            body.append(piece)
+        }
+        body.append("]}")
+        return body
     }
 
     // MARK: - Data Management
@@ -619,6 +829,22 @@ open class DbSyncHelper: NSObject {
         let filter = "id > \(lastUploadedId)"
         let candidates = self.engine.fetch(filter: filter, limit: limit)
         return candidates ?? []
+    }
+
+    /**
+     * Get upload candidate data as JSON
+     *
+     * The rows `getUploadCandidates(lastUploadedId:limit:)` returns, each already written as the JSON
+     * object it is uploaded as (`id` is left out for AWARE Light). Used while choosing the rows of a
+     * request, so that no dictionary is made per row. Returns nil when the engine cannot do this;
+     * the sync then uses `getUploadCandidates`.
+     *
+     * A subclass that overrides `getUploadCandidates` to change the rows must override this too
+     * (returning nil is enough), or the rows it changes are uploaded unchanged.
+     */
+    open func getUploadCandidateJSON(lastUploadedId: Int64, limit: Int) -> [UploadRowJSON]? {
+        let omitting: Set<String> = config.serverType == .aware_light ? ["id"] : []
+        return engine.fetchUploadJSON(afterId: lastUploadedId, limit: limit, omitting: omitting)
     }
 
     /// Rows deleted per transaction, and transactions per call, by `removeUploadedCandidates`.
@@ -861,7 +1087,7 @@ open class DbSyncHelper: NSObject {
         }
 
         // Reset state to idle after completion/failure to allow future syncs
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+        syncQueue.asyncAfter(deadline: .now() + 0.1) { [weak self] in
             self?.syncState = .idle
             if self?.config.debug == true {
                 self?.logTrace("Sync state reset to idle")
@@ -874,8 +1100,12 @@ open class DbSyncHelper: NSObject {
      */
     private func handleNextBatch() {
         logInfo("A sync task is done. Execute a next sync task.")
-        DispatchQueue.main.asyncAfter(deadline: DispatchTime.now() + DbSyncConstants.nextBatchDelay)
-        { [weak self] in
+        // Rest in proportion to the CPU time of the last batch, on the sync queue (not the main thread)
+        let rest = SyncPacing.rest(workSeconds: batchWorkSeconds, config: config)
+        if config.debug {
+            logVerbose(String(format: "Next batch in %.3f s (work %.3f s)", rest, batchWorkSeconds))
+        }
+        onSyncQueue(after: rest) { [weak self] in
             // Calculate and report progress
             if let pCallback = self?.config.progressHandler {
                 // Calculate progress based on uploaded records vs total records
@@ -917,35 +1147,38 @@ open class DbSyncHelper: NSObject {
      * 2. JSON serialization
      * 3. HTTP request construction and transmission
      *
-     * @param candidates Array of data to be uploaded
+     * @param candidates Array of data to be uploaded. All of them are sent in one request; a sync
+     *   started with `run(completion:)` chooses its rows by size instead (`maxBatchBytes`).
      */
     open func upload(_ candidates: [[String: Any]]) {
+        send(count: candidates.count, lastId: candidates.last?["id"] as? Int64, rows: candidates, body: nil,
+             isLast: candidates.count < max(1, config.maxBatchRows))
+    }
+
+    /// Send one request of `count` rows ending with row `lastId`. The body is `body` when it was already
+    /// built, otherwise it is built from `rows`.
+    private func send(count: Int, lastId: Int64?, rows: [[String: Any]]?, body prebuiltBody: String?, isLast: Bool) {
         if config.debug {
-            logVerbose("upload() started with \(candidates.count) candidates")
+            logVerbose("upload() started with \(count) candidates")
         }
 
         // Record current batch size
-        self.currentNumOfCandidates = candidates.count
+        self.currentNumOfCandidates = count
         self.lastActivity = Date().timeIntervalSince1970
 
         // Record ID of the last data (used when sync is completed)
-        self.idOfLastCandidate = nil
-        if let lastCandidate = candidates.last {
-            if let candidateId = lastCandidate["id"] as? Int64 {
-                self.idOfLastCandidate = candidateId
-                if config.debug {
-                    logTrace("idOfLastCandidate: \(candidateId)")
-                }
-            }
+        self.idOfLastCandidate = lastId
+        if let candidateId = lastId, config.debug {
+            logTrace("idOfLastCandidate: \(candidateId)")
         }
 
         // Output debug information
         if self.config.debug {
-            logInfo("Data count = \(candidates.count)")
+            logInfo("Data count = \(count)")
         }
 
         // If data is empty, process as sync completed
-        if candidates.count == 0 {
+        if count == 0 {
             syncState = .completed
             if self.config.debug {
                 logInfo("A sync process is done: No Data")
@@ -964,7 +1197,7 @@ open class DbSyncHelper: NSObject {
             }
 
             // Reset state to idle after completion
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            syncQueue.asyncAfter(deadline: .now() + 0.1) { [weak self] in
                 self?.syncState = .idle
                 if self?.config.debug == true {
                     self?.logTrace("Sync state reset to idle (no data)")
@@ -973,14 +1206,17 @@ open class DbSyncHelper: NSObject {
             return
         }
 
-        // Determine if this is the final batch (for controlling next run() call)
-        if candidates.count < self.config.batchSize {
-            self.isLastBatch = true
-        }
+        // Whether rows remain after this request (decided when the rows were chosen)
+        self.isLastBatch = isLast
+        self.lastStatusCode = nil
+        self.lastRetryAfter = nil
 
         do {
-            // Build HTTP request body
-            let requestBody = try buildRequestBody(from: candidates)
+            // Build HTTP request body (unless it was built while choosing the rows)
+            let started = Date()
+            let requestBody = try prebuiltBody ?? buildRequestBody(from: rows ?? [])
+            batchWorkSeconds += Date().timeIntervalSince(started)
+            currentBodyBytes = requestBody.utf8.count
 
             // Build HTTP request
             if let request = buildHTTPRequest(with: requestBody) {
@@ -999,7 +1235,7 @@ open class DbSyncHelper: NSObject {
 
                 // Add task description for better debugging
                 task.taskDescription =
-                    "Upload[\(tableName)]_Batch[\(candidates.count)]_LastID[\(idOfLastCandidate ?? 0)]"
+                    "Upload[\(tableName)]_Batch[\(count)]_LastID[\(idOfLastCandidate ?? 0)]"
 
                 // Send actual HTTP request
                 task.resume()
@@ -1018,7 +1254,7 @@ open class DbSyncHelper: NSObject {
             }
 
             // Reset state to idle after error
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            syncQueue.asyncAfter(deadline: .now() + 0.1) { [weak self] in
                 self?.syncState = .idle
                 if self?.config.debug == true {
                     self?.logTrace("Sync state reset to idle (JSON error)")
@@ -1076,7 +1312,8 @@ open class DbSyncHelper: NSObject {
             sessionConfig.sharedContainerIdentifier = DbSyncConstants.sharedContainerIdentifier
         }
 
-        return URLSession(configuration: sessionConfig, delegate: self, delegateQueue: nil)
+        // Callbacks run on the sync queue, like the rest of the sync
+        return URLSession(configuration: sessionConfig, delegate: self, delegateQueue: delegateQueue)
     }
 
     /**
@@ -1153,7 +1390,7 @@ open class DbSyncHelper: NSObject {
             }
 
             // Wait for completion of all task cancellations
-            group.notify(queue: .main) {
+            group.notify(queue: self?.syncQueue ?? .global(qos: .utility)) {
                 completion()
             }
         }
@@ -1178,6 +1415,11 @@ open class DbSyncHelper: NSObject {
     ) {
 
         if let httpResponse = response as? HTTPURLResponse {
+            lastStatusCode = httpResponse.statusCode
+            if let value = httpResponse.value(forHTTPHeaderField: "Retry-After"),
+               let seconds = TimeInterval(value.trimmingCharacters(in: .whitespaces)) {
+                lastRetryAfter = seconds
+            }
             if DbSyncConstants.httpSuccessRange.contains(httpResponse.statusCode) {
                 // 2xx status codes are processed as success
                 completionHandler(URLSession.ResponseDisposition.allow)
@@ -1231,6 +1473,21 @@ open class DbSyncHelper: NSObject {
     ) {
         let responseState = evaluateResponseState(error: error, task: task, session: session)
 
+        // A body that was too large (413), a timeout, or a busy server (429, 503): send again,
+        // smaller or later, instead of ending the sync
+        if !responseState, let delay = retryDelayAfterFailure(error: error) {
+            invalidateSession(waitForTasks: false)
+            receivedData = Data()
+            onSyncQueue(after: delay) { [weak self] in
+                self?.performDataSync()
+            }
+            return
+        }
+        if responseState {
+            adjustRetries = 0
+            SyncBatchLimit.recordSuccess(host: limitHost)
+        }
+
         // Debug output of server response
         if self.config.debug {
             let response = String(data: receivedData, encoding: .utf8) ?? ""
@@ -1256,7 +1513,9 @@ open class DbSyncHelper: NSObject {
 
             // Delete uploaded data (according to settings)
             if config.removeAfterSync {
+                let started = Date()
                 removeUploadedCandidates(lastUploadedId: lastUploadedId, limit: config.batchSize)
+                batchWorkSeconds += Date().timeIntervalSince(started)
             }
 
             // Finally update uploaded ID
@@ -1271,6 +1530,41 @@ open class DbSyncHelper: NSObject {
 
         // Execute subsequent processing
         handleUploadCompletion(responseState: responseState, error: error)
+    }
+
+    /// Whether to send the batch again after a failure, and after how long.
+    ///
+    /// - 413: the host's size limit becomes half of the rejected body (`SyncBatchLimit`, remembered),
+    ///   and the batch is chosen again right away. A single row that is too large cannot be split.
+    /// - Timeout: the limit is halved for this run of the app, and the batch is chosen again.
+    /// - 429 / 503: wait for Retry-After (or 5, 10, 20 s), at most 120 s.
+    /// At most 8 retries in a row (3 for timeouts and 429/503); then the sync fails as before.
+    private func retryDelayAfterFailure(error: Error?) -> TimeInterval? {
+        guard adjustRetries < 8 else { return nil }
+        let timedOut = (error as NSError?).map { $0.domain == NSURLErrorDomain && $0.code == NSURLErrorTimedOut } ?? false
+        if lastStatusCode == 413 {
+            guard currentNumOfCandidates > 1 else {
+                logError("Server rejected a single row of \(currentBodyBytes) bytes as too large (413)")
+                return nil
+            }
+            let limit = SyncBatchLimit.recordTooLarge(host: limitHost, bodyBytes: currentBodyBytes)
+            adjustRetries += 1
+            logWarning("Server rejected \(currentBodyBytes) bytes (413); sending again with up to \(limit) bytes")
+            return 0
+        }
+        if timedOut && currentNumOfCandidates > 1 && adjustRetries < 3 {
+            let limit = SyncBatchLimit.recordTimeout(host: limitHost, bodyBytes: currentBodyBytes)
+            adjustRetries += 1
+            logWarning("Request of \(currentBodyBytes) bytes timed out; sending again with up to \(limit) bytes")
+            return 0
+        }
+        if let code = lastStatusCode, code == 429 || code == 503, adjustRetries < 3 {
+            adjustRetries += 1
+            let wait = min(lastRetryAfter ?? 5 * pow(2, Double(adjustRetries - 1)), 120)
+            logWarning("Server is busy (\(code)); sending again in \(Int(wait)) s")
+            return wait
+        }
+        return nil
     }
 
     /**

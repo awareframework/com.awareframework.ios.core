@@ -7,7 +7,18 @@
 ///   - removeAfterSync: A boolean indicating whether to remove data after synchronization. Default is `true`.
 ///   - keepDataAfterSync: Seconds to keep uploaded data on the device before `removeAfterSync` deletes it. Default is one day (`86400`).
 ///   - keepPeriod: `keepDataAfterSync` as a period (`.immediately`, `.hour`, `.day`, `.week`, `.month`).
-///   - batchSize: An integer specifying the number of records to sync in each batch. Default is `1000`.
+///   - batchSize: Rows read from the database at a time while a request is built. Default is `1000`.
+///     (Up to 1.6, it was the number of rows per request. A request now holds as many rows as fit
+///     in `maxBatchBytes`, up to `maxBatchRows`.)
+///   - maxBatchBytes: Largest request body in bytes. `nil` (default) chooses by server type: 4 MB for
+///     AWARE Micro (Google App Engine accepts 32 MB), 900 KB for other servers (below the nginx default
+///     of 1 MB). A host that answers 413 gets a smaller limit, which is remembered. See `SyncBatchLimit`.
+///   - maxBatchRows: Largest number of rows per request. Default is `20000`.
+///   - batchInterval: Shortest rest between requests, in seconds. Default is `0`. (1.6 waited 0.1 s.)
+///   - cpuRestRatio: Rest between requests, as a multiple of the CPU time the last request took to
+///     prepare, while the app is in the foreground. Default is `1` (the sync uses at most about half
+///     of a CPU core). See `SyncPacing`.
+///   - backgroundCpuRestRatio: The same while the app is in the background. Default is `3`.
 ///   - markAsSynced: A boolean indicating whether to mark data as synced after synchronization. Default is `false`.
 ///   - skipSyncedData: A boolean indicating whether to skip already synced data. Default is `false`.
 ///   - keepLastData: A boolean indicating whether to keep the last data after synchronization. Default is `false`.
@@ -109,6 +120,11 @@ public class DbSyncConfig {
         set { if let period = newValue { keepDataAfterSync = period.seconds } }
     }
     public var batchSize: Int = 1000
+    public var maxBatchBytes: Int? = nil
+    public var maxBatchRows: Int = 20000
+    public var batchInterval: TimeInterval = 0
+    public var cpuRestRatio: Double = 1
+    public var backgroundCpuRestRatio: Double = 3
     public var markAsSynced: Bool = false
     public var skipSyncedData: Bool = false
     public var keepLastData: Bool = false
@@ -143,6 +159,11 @@ public class DbSyncConfig {
         c.removeAfterSync = removeAfterSync
         c.keepDataAfterSync = keepDataAfterSync
         c.batchSize = batchSize
+        c.maxBatchBytes = maxBatchBytes
+        c.maxBatchRows = maxBatchRows
+        c.batchInterval = batchInterval
+        c.cpuRestRatio = cpuRestRatio
+        c.backgroundCpuRestRatio = backgroundCpuRestRatio
         c.markAsSynced = markAsSynced
         c.skipSyncedData = skipSyncedData
         c.keepLastData = keepLastData
@@ -178,6 +199,23 @@ public class DbSyncConfig {
 
         if let batchSize = config["batchSize"] as? Int {
             self.batchSize = batchSize
+        }
+        if let bytes = config["maxBatchBytes"] as? Int {
+            self.maxBatchBytes = bytes
+        }
+        if let rows = config["maxBatchRows"] as? Int {
+            self.maxBatchRows = rows
+        }
+        if let interval = config["batchInterval"] as? Double {
+            self.batchInterval = interval
+        } else if let interval = config["batchInterval"] as? Int {
+            self.batchInterval = TimeInterval(interval)
+        }
+        if let ratio = config["cpuRestRatio"] as? Double {
+            self.cpuRestRatio = ratio
+        }
+        if let ratio = config["backgroundCpuRestRatio"] as? Double {
+            self.backgroundCpuRestRatio = ratio
         }
 
         if let markAsSynced = config["markAsSynced"] as? Bool {

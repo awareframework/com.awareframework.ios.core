@@ -142,6 +142,75 @@ open class Engine: EngineProtocal {
     /// The largest row ID ever assigned in the table, or `nil` when the engine cannot tell.
     /// Used to check that a sync marker belongs to this database.
     open func maxAssignedId(tableName: String) -> Int64? { nil }
+
+    /// Rows with an ID above `afterId`, lowest ID first, at most `limit`, each written as the JSON
+    /// object it is uploaded as (the columns as keys, NULL columns left out, `omitting` left out).
+    ///
+    /// The sync uses this to build a request without making a dictionary for every row. Returns `nil`
+    /// when the engine cannot do this; the sync then uses `fetch(filter:limit:)`.
+    open func fetchUploadJSON(afterId: Int64, limit: Int, omitting: Set<String>) -> [UploadRowJSON]? { nil }
+}
+
+/// A row ready for upload: its ID and its JSON object, or `nil` when the row cannot be written as
+/// JSON (a BLOB, or a number that is not finite).
+public struct UploadRowJSON {
+    public let id: Int64
+    public let json: String?
+
+    public init(id: Int64, json: String?) {
+        self.id = id
+        self.json = json
+    }
+}
+
+/// Writes SQLite values as JSON, the same values `JSONSerialization` writes for the rows that
+/// `fetch(filter:limit:)` returns. Numbers keep their full precision: a REAL is written with the
+/// shortest text that reads back as the same Double.
+enum UploadJSONWriter {
+
+    /// Appends `"key":` to `out`.
+    static func appendKey(_ key: String, to out: inout String) {
+        appendString(key, to: &out)
+        out.append(":")
+    }
+
+    /// Appends `value` as a JSON number. Returns false for infinity and NaN, which JSON cannot hold.
+    static func appendDouble(_ value: Double, to out: inout String) -> Bool {
+        guard value.isFinite else { return false }
+        out.append(value.description)
+        return true
+    }
+
+    /// Appends `text` as a JSON string.
+    static func appendString(_ text: String, to out: inout String) {
+        out.append("\"")
+        var plainStart = text.unicodeScalars.startIndex
+        let scalars = text.unicodeScalars
+        var index = scalars.startIndex
+        while index < scalars.endIndex {
+            let scalar = scalars[index]
+            let escaped: String?
+            switch scalar {
+            case "\"": escaped = "\\\""
+            case "\\": escaped = "\\\\"
+            case "\n": escaped = "\\n"
+            case "\r": escaped = "\\r"
+            case "\t": escaped = "\\t"
+            case _ where scalar.value < 0x20:
+                let hex = String(scalar.value, radix: 16)
+                escaped = "\\u" + String(repeating: "0", count: 4 - hex.count) + hex
+            default: escaped = nil
+            }
+            if let escaped {
+                out.unicodeScalars.append(contentsOf: scalars[plainStart..<index])
+                out.append(escaped)
+                plainStart = scalars.index(after: index)
+            }
+            index = scalars.index(after: index)
+        }
+        out.unicodeScalars.append(contentsOf: scalars[plainStart..<scalars.endIndex])
+        out.append("\"")
+    }
 }
 
 // MARK: - String hashing utilities
