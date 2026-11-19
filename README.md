@@ -188,7 +188,7 @@ sensor.enable()   // subscribes to sync broadcast
 
 ```swift
 let syncConfig = DbSyncConfig()
-syncConfig.batchSize        = 500
+syncConfig.maxBatchBytes    = 4_000_000   // optional; by server type when not set
 syncConfig.removeAfterSync  = true
 syncConfig.keepPeriod       = .day   // or keepDataAfterSync = 86400 (seconds)
 syncConfig.compactDataFormat = false
@@ -324,7 +324,12 @@ Per-table upload settings, used by `DbSyncHelper`.
 | `serverType: ServerType` | `DbSyncConfig.defaultServerType` (`.aware_micro`) | Server protocol; selects the upload URL (see [Upload URL](#upload-url)). |
 | `studyNumber: Int` | `DbSyncConfig.defaultStudyNumber` (`1`) | Study number in the upload URL. |
 | `studyKey: String` | `DbSyncConfig.defaultStudyKey` (`""`) | Study key in the upload URL. |
-| `batchSize: Int` | `1000` | Rows per upload request. Larger backlogs are sent in several requests in one sync. |
+| `maxBatchBytes: Int?` | `nil` (by server type) | Largest request body in bytes. A request holds as many rows as fit. `nil` chooses 4 MB for AWARE Micro (Google App Engine accepts up to 32 MB) and 900 KB for other servers (below the nginx default of 1 MB). See [Request size](#request-size). Dictionary key: `"maxBatchBytes"`. |
+| `maxBatchRows: Int` | `20000` | Largest number of rows per request. Dictionary key: `"maxBatchRows"`. |
+| `batchSize: Int` | `1000` | Rows read from the database at a time while a request is built. (Up to 1.6 it was the number of rows per request; requests are now sized by `maxBatchBytes`.) |
+| `batchInterval: TimeInterval` | `0` | Shortest rest between requests, in seconds. 1.6 always waited 0.1 s; set `0.1` for that behaviour. |
+| `cpuRestRatio: Double` | `1` | Rest between requests as a multiple of the CPU time the last request took to prepare (reading rows, building the body, deleting uploaded rows), while the app is in the foreground. `1` keeps a sync at about half of one CPU core. See [Pacing](#pacing). |
+| `backgroundCpuRestRatio: Double` | `3` | The same while the app is in the background, where iOS may stop an app that keeps the CPU busy. |
 | `removeAfterSync: Bool` | `true` | Delete uploaded rows from the local database once they are older than `keepDataAfterSync`. Rows that have not been uploaded are never deleted. Set `false` to keep every row. |
 | `keepDataAfterSync: TimeInterval` | `86400` (one day) | Seconds to keep uploaded rows on the device, counted from each row's `timestamp`. `0` deletes them right after upload. Negative values are ignored. Dictionary key: `"keepDataAfterSync"`. |
 | `keepPeriod: DbSyncConfig.KeepPeriod?` | `.day` | `keepDataAfterSync` as a period: `.immediately` (0), `.hour`, `.day`, `.week`, `.month` (30 days). Setting it sets `keepDataAfterSync`; reading it gives `nil` for other values. Dictionary key: `"keepPeriod"` (e.g. `"week"`). |
@@ -349,14 +354,35 @@ All settings can also be given as a dictionary with `DbSyncConfig(_:)` or `set(c
 
 `DbSyncHelper` uploads each table incrementally:
 
-1. **Progress is tracked by row ID.** Every table of every database stores the ID of the last row uploaded successfully in `UserDefaults` (see [Sync markers](#sync-markers)). A sync sends rows with `id` greater than that value, in batches of `batchSize`, in ID order. `Engine.fetch(filter:limit:)` returns rows in row ID order (`ORDER BY rowid`) unless the filter has its own `ORDER BY`, so each batch is the lowest IDs above the marker whatever query plan SQLite chooses.
+1. **Progress is tracked by row ID.** Every table of every database stores the ID of the last row uploaded successfully in `UserDefaults` (see [Sync markers](#sync-markers)). A sync sends rows with `id` greater than that value, in requests of up to `maxBatchBytes`, in ID order. `Engine.fetch(filter:limit:)` returns rows in row ID order (`ORDER BY rowid`) unless the filter has its own `ORDER BY`, so each batch is the lowest IDs above the marker whatever query plan SQLite chooses.
 2. **Only HTTP 2xx counts as success.** The last uploaded ID advances (and, with `removeAfterSync`, uploaded rows older than `keepDataAfterSync` are deleted) only after the server answers with a 2xx status.
-3. **Failed rows are retried.** On a non-2xx status, a network error, or a timeout (30 s per request), the last uploaded ID does not change and the sync of that table stops. The same rows are sent again at the next sync. Nothing is lost while the server is down, and the backlog is sent in batches once it is back.
+3. **Failed rows are retried.** On a non-2xx status, a network error, or a timeout (30 s per request), the last uploaded ID does not change and the sync of that table stops. (Exceptions within a sync: a 413 or a timeout sends the same rows again in a smaller request, and 429 or 503 sends them again after Retry-After; see [Request size](#request-size).) The same rows are sent again at the next sync. Nothing is lost while the server is down, and the backlog is sent in batches once it is back.
 4. **Uploaded rows are not sent again.** Rows at or below the last uploaded ID are never selected again, whether or not they are kept locally.
 5. **Delivery is at least once.** If the server stores a batch but the response does not reach the app (for example, the app is killed while waiting), that batch is sent again at the next sync. Servers should tolerate duplicates, for example by ignoring rows with the same `timestamp` and device ID.
 6. **One sync per table at a time.** When a sync is requested while another sync of the same table of the same database is running (for example, `DbSyncManager.sync()` followed by `sensor.sync(force: true)`), the running sync is not stopped. Stopping it would cancel a request that the server may already have stored, and its rows would be sent again. Instead, one more sync runs after the current one, however many requests were made meanwhile, and every completion handler is called. A sync with no activity for 330 s is treated as stopped, and the next request starts a new one.
 
 The last uploaded ID survives app restarts. Deleting the app resets it.
+
+### Request size
+
+Each request holds as many rows as fit in the size limit, in the form the server receives them (JSON for AWARE Micro and AWARE Light; URL-encoded form for the legacy AWARE server, where the encoding makes a row about twice as large). Each row is turned into JSON once, measured, and reused for the body. The first row of a request is always included, so a row larger than the limit is sent alone.
+
+| Situation | What the sync does |
+|---|---|
+| Default | `maxBatchBytes`, or 4 MB (AWARE Micro) / 900 KB (other servers) |
+| The server answers 413 | Half of the rejected size becomes the host's limit, saved in `UserDefaults` (`aware.sync.max_batch_bytes.<host>`), and the same rows are sent again right away. A server with nginx's default 1 MB limit costs two rejected requests once (4 MB, 2 MB), then every request fits. |
+| A request times out | The limit is halved for this run of the app and the rows are sent again; after 20 successful requests in a row it grows back by half, up to the default. |
+| 429 or 503 | Wait for `Retry-After` (or 5, 10, 20 s, at most 120 s) and send again, up to 3 times. |
+
+`SyncBatchLimit.reset(host:)` forgets what was learned. With `compactDataFormat` or `createHttpRequestBodyHandler`, the body is built as a whole and rows are removed until it fits.
+
+With `SQLiteEngine`, each row is written as JSON straight from the values SQLite returns (`Engine.fetchUploadJSON(afterId:limit:omitting:)`), without making a dictionary for the row first. The values are the same as before: NULL columns are left out, and a REAL is written with the shortest text that reads back as the same Double, so no precision is lost. (SQLite's own `json_object()` is not used: it keeps only 15 significant digits, so a millisecond timestamp stored as REAL would lose its last digits.) A row JSON cannot hold (a BLOB, or infinity or NaN) goes through the general builder as before. A `DbSyncHelper` subclass that overrides `getUploadCandidates(lastUploadedId:limit:)` to change the rows must also override `getUploadCandidateJSON(lastUploadedId:limit:)` (returning `nil` is enough).
+
+### Pacing
+
+All sync work (reading rows, building requests, the URLSession callbacks, deleting uploaded rows) runs on a serial queue per table, never on the main thread, so a sync does not freeze the UI. Completion and progress handlers are still called on the main thread.
+
+Between requests the sync rests for `cpuRestRatio` (foreground) or `backgroundCpuRestRatio` (background) times the CPU time the last request took to prepare. Waiting for the server is not counted, so on a slow network the sync does not wait longer than needed, and on a fast network it leaves the CPU idle at least half of the time (three quarters in the background). The work also runs with a lower priority in the background (`.background` instead of `.utility`). The rest is doubled in Low Power Mode, at least 5 s when the device is hot (`thermalState` serious) and 30 s when critical, and at most 120 s.
 
 ### Removing uploaded rows
 

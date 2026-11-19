@@ -334,6 +334,11 @@ class UnitTests: XCTestCase {
         original.removeAfterSync = false
         original.keepDataAfterSync = 123
         original.batchSize = 42
+        original.maxBatchBytes = 123_456
+        original.maxBatchRows = 77
+        original.batchInterval = 0.5
+        original.cpuRestRatio = 2
+        original.backgroundCpuRestRatio = 5
         original.markAsSynced = true
         original.skipSyncedData = true
         original.keepLastData = true
@@ -359,7 +364,7 @@ class UnitTests: XCTestCase {
             })
         }
         let defaults = values(DbSyncConfig()), originals = values(original), copies = values(copy)
-        XCTAssertEqual(originals.count, 18, "a property was added or removed: update copy() and this test")
+        XCTAssertEqual(originals.count, 23, "a property was added or removed: update copy() and this test")
         for (name, value) in originals {
             XCTAssertNotEqual(value, defaults[name], "\(name) is not set in this test")
             XCTAssertEqual(copies[name], value, "\(name) is not copied by copy()")
