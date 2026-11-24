@@ -236,6 +236,30 @@ open class DbSyncHelper: NSObject {
     /// Current state of synchronization process
     private var syncState: SyncState = .idle
 
+    /// Once a helper is stopped it must never resume queued batches or a delayed `run` call.
+    /// A helper belongs to one sync attempt, so this flag intentionally stays set for its lifetime.
+    private let stopLock = NSLock()
+    private var stopRequested = false
+
+    private var isStopRequested: Bool {
+        stopLock.lock()
+        defer { stopLock.unlock() }
+        return stopRequested
+    }
+
+    private func requestStop() {
+        stopLock.lock()
+        stopRequested = true
+        stopLock.unlock()
+    }
+
+    /// Marks this helper as permanently cancelled before asynchronous shutdown begins.
+    /// SQLiteEngine uses this while holding its sync-slot lock so no request can slip through
+    /// between removing a slot and cancelling its helper.
+    func requestCancellation() {
+        requestStop()
+    }
+
     /// Timestamp when sync started (for timeout detection)
     private var syncStartTime: TimeInterval = 0
 
@@ -445,6 +469,7 @@ open class DbSyncHelper: NSObject {
      * @param completion Completion callback for synchronization
      */
     open func run(completion: DbSyncCompletionHandler?) {
+        guard isStopRequested == false else { return }
         logTrace("run() started")
 
         // Check if another sync is already in progress
@@ -561,6 +586,7 @@ open class DbSyncHelper: NSObject {
      * Start the actual sync process
      */
     private func startSyncProcess(completion: DbSyncCompletionHandler?) {
+        guard isStopRequested == false else { return }
         if config.debug {
             logVerbose("→ startSyncProcess() started")
         }
@@ -587,15 +613,17 @@ open class DbSyncHelper: NSObject {
      * Execute the main sync workflow
      */
     private func executeSyncWorkflow() {
+        guard isStopRequested == false else { return }
         if config.debug {
             logVerbose("→ executeSyncWorkflow() started")
         }
 
         cancelAllTasks { [weak self] in
-            if self?.config.debug == true {
-                self?.logVerbose("→ executeSyncWorkflow() tasks cancelled, proceeding to data sync")
+            guard let self, self.isStopRequested == false else { return }
+            if self.config.debug {
+                self.logVerbose("→ executeSyncWorkflow() tasks cancelled, proceeding to data sync")
             }
-            self?.performDataSync()
+            self.performDataSync()
         }
     }
 
@@ -603,6 +631,7 @@ open class DbSyncHelper: NSObject {
      * Perform the actual data synchronization
      */
     private func performDataSync() {
+        guard isStopRequested == false else { return }
         if config.debug {
             logVerbose("→ performDataSync() started")
         }
@@ -1038,6 +1067,7 @@ open class DbSyncHelper: NSObject {
      * @param error Error (if any)
      */
     private func handleUploadCompletion(responseState: Bool, error: Error?) {
+        guard isStopRequested == false else { return }
         if responseState {
             // Success processing branch
             if isLastBatch {
@@ -1058,6 +1088,7 @@ open class DbSyncHelper: NSObject {
      * @param error Error (if any)
      */
     private func handleSyncCompletion(success: Bool, error: Error?) {
+        guard isStopRequested == false else { return }
         // Set final state
         if success {
             syncState = .completed
@@ -1074,14 +1105,16 @@ open class DbSyncHelper: NSObject {
 
         // Report 100% progress
         if let pCallback = self.config.progressHandler {
-            DispatchQueue.main.async {
+            DispatchQueue.main.async { [weak self] in
+                guard self?.isStopRequested == false else { return }
                 pCallback(success ? 1.0 : 0.0, error)
             }
         }
 
         // Call completion callback
         if let callback = self.completion {
-            DispatchQueue.main.async {
+            DispatchQueue.main.async { [weak self] in
+                guard self?.isStopRequested == false else { return }
                 callback(success, error)
             }
         }
@@ -1106,6 +1139,7 @@ open class DbSyncHelper: NSObject {
             logVerbose(String(format: "Next batch in %.3f s (work %.3f s)", rest, batchWorkSeconds))
         }
         onSyncQueue(after: rest) { [weak self] in
+            guard self?.isStopRequested == false else { return }
             // Calculate and report progress
             if let pCallback = self?.config.progressHandler {
                 // Calculate progress based on uploaded records vs total records
@@ -1121,7 +1155,8 @@ open class DbSyncHelper: NSObject {
                         "Progress: \(uploadedItems)/\(totalItems) records (\(percentage)%)")
                 }
 
-                DispatchQueue.main.async {
+                DispatchQueue.main.async { [weak self] in
+                    guard self?.isStopRequested == false else { return }
                     pCallback(p, nil)
                 }
             }
@@ -1158,6 +1193,7 @@ open class DbSyncHelper: NSObject {
     /// Send one request of `count` rows ending with row `lastId`. The body is `body` when it was already
     /// built, otherwise it is built from `rows`.
     private func send(count: Int, lastId: Int64?, rows: [[String: Any]]?, body prebuiltBody: String?, isLast: Bool) {
+        guard isStopRequested == false else { return }
         if config.debug {
             logVerbose("upload() started with \(count) candidates")
         }
@@ -1185,13 +1221,15 @@ open class DbSyncHelper: NSObject {
             }
             // Report progress as 100%
             if let pCallback = self.config.progressHandler {
-                DispatchQueue.main.async {
+                DispatchQueue.main.async { [weak self] in
+                    guard self?.isStopRequested == false else { return }
                     pCallback(1.0, nil)
                 }
             }
             // Call completion callback
             if let callback = self.completion {
-                DispatchQueue.main.async {
+                DispatchQueue.main.async { [weak self] in
+                    guard self?.isStopRequested == false else { return }
                     callback(true, nil)
                 }
             }
@@ -1220,6 +1258,7 @@ open class DbSyncHelper: NSObject {
 
             // Build HTTP request
             if let request = buildHTTPRequest(with: requestBody) {
+                guard isStopRequested == false else { return }
                 if self.config.test {
                     // Test mode should not leave synthetic URLSession tasks behind.
                     // A suspended task is later returned by getAllTasks() and can be
@@ -1228,6 +1267,13 @@ open class DbSyncHelper: NSObject {
                     return
                 }
 
+                // Serialize the final stop check with `requestStop()`. If stopping wins, no new
+                // session is created; if sending wins, stop immediately cancels the resumed task.
+                stopLock.lock()
+                guard stopRequested == false else {
+                    stopLock.unlock()
+                    return
+                }
                 let session = getOrCreateURLSession()
 
                 // Create and execute data task
@@ -1239,6 +1285,7 @@ open class DbSyncHelper: NSObject {
 
                 // Send actual HTTP request
                 task.resume()
+                stopLock.unlock()
             }
         } catch {
             // Handle JSON serialization error
@@ -1248,7 +1295,8 @@ open class DbSyncHelper: NSObject {
             // Stop sync on error and call callback
             syncState = .failed(error)
             if let callback = self.completion {
-                DispatchQueue.main.async {
+                DispatchQueue.main.async { [weak self] in
+                    guard self?.isStopRequested == false else { return }
                     callback(false, error)
                 }
             }
@@ -1264,6 +1312,7 @@ open class DbSyncHelper: NSObject {
     }
 
     private func handleSuccessfulUploadCompletion() {
+        guard isStopRequested == false else { return }
         if config.debug {
             logInfo("Success: A sync task is done correctly.")
         }
@@ -1471,6 +1520,7 @@ open class DbSyncHelper: NSObject {
     open func urlSession(
         _ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?
     ) {
+        guard isStopRequested == false else { return }
         let responseState = evaluateResponseState(error: error, task: task, session: session)
 
         // A body that was too large (413), a timeout, or a busy server (429, 503): send again,
@@ -1719,6 +1769,7 @@ open class DbSyncHelper: NSObject {
      */
     open func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data)
     {
+        guard isStopRequested == false else { return }
         if config.debug {
             logTrace("Task completed: \(#function):\(dataTask.taskIdentifier)")
         }
@@ -1825,6 +1876,13 @@ open class DbSyncHelper: NSObject {
      * @param handler Callback when stop is completed
      */
     public func stop(_ handler: (() -> Void)? = nil) {
+        stopImmediately(handler)
+    }
+
+    /// Permanently cancels this sync attempt. Unlike the legacy `stop()` API, a cancelled helper
+    /// cannot be restarted; SQLiteEngine creates a fresh helper for the next upload attempt.
+    public func cancel(_ handler: (() -> Void)? = nil) {
+        requestCancellation()
         stopImmediately(handler)
     }
 

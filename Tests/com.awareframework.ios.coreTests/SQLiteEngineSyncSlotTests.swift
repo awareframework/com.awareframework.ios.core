@@ -144,4 +144,73 @@ class SQLiteEngineSyncSlotTests: XCTestCase {
         wait(for: [done], timeout: 10)
         queue.resume()
     }
+
+    func testStopAllSyncsCancelsQueuedWorkAndFreesEverySlot() throws {
+        let first = try makeEngine("slot_stop_all_\(UUID().uuidString)")
+        let secondTable = "slot_stop_all_other"
+        let second = try makeEngine("slot_stop_all_\(UUID().uuidString)", table: secondTable)
+        defer { DbSyncUtils.clearLastUploadedId(for: secondTable) }
+
+        let heldQueue = DispatchQueue(label: "slot.stop.all.held")
+        heldQueue.suspend()
+        let oldCompletion = expectation(description: "stopped syncs do not complete")
+        oldCompletion.expectedFulfillmentCount = 2
+        oldCompletion.isInverted = true
+        first.startSync(syncConfig(heldQueue) { _, _ in oldCompletion.fulfill() })
+        second.startSync(syncConfig(heldQueue) { _, _ in oldCompletion.fulfill() })
+
+        let stopped = expectation(description: "all syncs stopped")
+        let stopRequestID = UUID()
+        let secondStopped = expectation(description: "coalesced stop request also completes")
+        let secondStopRequestID = UUID()
+        let stopObserver = NotificationCenter.default.addObserver(
+            forName: Notification.Name.Aware.dbSyncStopCompletion,
+            object: nil,
+            queue: .main
+        ) { notification in
+            guard let receivedRequestID = notification.object as? UUID else { return }
+            switch receivedRequestID {
+            case stopRequestID:
+                stopped.fulfill()
+            case secondStopRequestID:
+                secondStopped.fulfill()
+            default:
+                break
+            }
+        }
+        defer { NotificationCenter.default.removeObserver(stopObserver) }
+        NotificationCenter.default.post(
+            name: Notification.Name.Aware.dbSyncStopRequest,
+            object: stopRequestID
+        )
+        NotificationCenter.default.post(
+            name: Notification.Name.Aware.dbSyncStopRequest,
+            object: secondStopRequestID
+        )
+
+        let racedCompletion = expectation(description: "sync racing with stop does not start")
+        racedCompletion.isInverted = true
+        first.startSync(syncConfig(DispatchQueue(label: "slot.stop.all.raced")) { _, _ in
+            racedCompletion.fulfill()
+        })
+
+        wait(for: [stopped, secondStopped], timeout: 10)
+        heldQueue.resume()
+
+        let restarted = expectation(description: "syncs can restart after stop all")
+        restarted.expectedFulfillmentCount = 2
+        let restartQueue = DispatchQueue(label: "slot.stop.all.restarted")
+        first.startSync(syncConfig(restartQueue) { status, _ in
+            XCTAssertTrue(status)
+            restarted.fulfill()
+        })
+        second.startSync(syncConfig(restartQueue) { status, _ in
+            XCTAssertTrue(status)
+            restarted.fulfill()
+        })
+
+        wait(for: [restarted], timeout: 10)
+        wait(for: [oldCompletion], timeout: 0.2)
+        wait(for: [racedCompletion], timeout: 0.2)
+    }
 }

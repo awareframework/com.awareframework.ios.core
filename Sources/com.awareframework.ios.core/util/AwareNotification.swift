@@ -10,5 +10,7 @@ import Foundation
 public extension Notification.Name{
     struct Aware {
         public static let dbSyncRequest = Notification.Name("AwareDBSyncRequest")
+        public static let dbSyncStopRequest = Notification.Name("AwareDBSyncStopRequest")
+        public static let dbSyncStopCompletion = Notification.Name("AwareDBSyncStopCompletion")
     }
 }

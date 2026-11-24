@@ -1,6 +1,30 @@
 import Foundation
 import GRDB
 
+private final class SQLiteSyncStopNotificationObserver: NSObject, @unchecked Sendable {
+    static let shared = SQLiteSyncStopNotificationObserver()
+
+    private override init() {
+        super.init()
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleStopRequest(_:)),
+            name: Notification.Name.Aware.dbSyncStopRequest,
+            object: nil
+        )
+    }
+
+    @objc private func handleStopRequest(_ notification: Notification) {
+        let requestID = notification.object as? UUID
+        SQLiteEngine.stopAllSyncs {
+            NotificationCenter.default.post(
+                name: Notification.Name.Aware.dbSyncStopCompletion,
+                object: requestID
+            )
+        }
+    }
+}
+
 open class SQLiteEngine: Engine {
 
     var syncHelper: DbSyncHelper?
@@ -11,6 +35,7 @@ open class SQLiteEngine: Engine {
 
     public override init(_ config: EngineConfig) {
         super.init(config)
+        _ = SQLiteSyncStopNotificationObserver.shared
         guard let path = config.path else {
             print("[Error][SQLiteEngine] database path is nil.")
             return
@@ -415,6 +440,8 @@ open class SQLiteEngine: Engine {
 
     private static var syncSlots: [String: SyncSlot] = [:]
     private static let syncSlotsLock = NSLock()
+    private static var isStoppingAllSyncs = false
+    private static var stopAllSyncCompletions: [() -> Void] = []
 
     /// A running sync with no activity for this long is treated as stopped (a request waits at most
     /// 300 s), and the next request starts a new sync instead of waiting for it.
@@ -439,6 +466,13 @@ open class SQLiteEngine: Engine {
         }
         let slotKey = "\(databaseIdentifier):\(tableName)"
         Self.syncSlotsLock.lock()
+        // A process-wide stop owns the current upload generation. Requests that race with it are
+        // discarded just like helpers that were already queued, and a later request can start once
+        // every cancellation has finished.
+        guard Self.isStoppingAllSyncs == false else {
+            Self.syncSlotsLock.unlock()
+            return
+        }
         let slot = Self.syncSlots[slotKey] ?? SyncSlot()
         Self.syncSlots[slotKey] = slot
         if slot.running {
@@ -456,7 +490,8 @@ open class SQLiteEngine: Engine {
                 return
             }
             print("[AWARE::Core] The sync of \(slotKey) has not responded for \(Int(idle)) s; starting a new sync")
-            slot.helper?.stop()
+            slot.helper?.cancel()
+            slot.helper = nil
         }
         slot.running = true
         Self.syncSlotsLock.unlock()
@@ -467,7 +502,12 @@ open class SQLiteEngine: Engine {
                             completions: [DbSyncCompletionHandler]) {
         guard let host = config.host, let tableName = config.tableName else { return }
         let helper = DbSyncHelper(engine: self, host: host, tableName: tableName, config: syncConfig)
+        let slotKey = "\(databaseIdentifier):\(tableName)"
         Self.syncSlotsLock.lock()
+        guard Self.syncSlots[slotKey] === slot, slot.running, slot.helper == nil else {
+            Self.syncSlotsLock.unlock()
+            return
+        }
         slot.helper = helper
         Self.syncSlotsLock.unlock()
         syncHelper = helper
@@ -502,13 +542,14 @@ open class SQLiteEngine: Engine {
         slot.pendingConfig = nil
         slot.pendingEngine = nil
         slot.pendingCompletions = []
+        slot.helper = nil
         syncSlotsLock.unlock()
         engine.launchSync(slot, next, completions: completions)
     }
 
     open override func stopSync() {
         guard let helper = syncHelper else { return }
-        helper.stop()
+        helper.cancel()
         if let tableName = config.tableName {
             Self.syncSlotsLock.lock()
             if let slot = Self.syncSlots["\(databaseIdentifier):\(tableName)"], slot.helper === helper {
@@ -520,6 +561,65 @@ open class SQLiteEngine: Engine {
             }
             Self.syncSlotsLock.unlock()
         }
+    }
+
+    /// Stops every SQLite upload currently running in this process and drops uploads queued behind
+    /// them. This is used by clients that present one aggregate upload operation for many sensors.
+    public static func stopAllSyncs(completion: (() -> Void)? = nil) {
+        syncSlotsLock.lock()
+        if let completion {
+            stopAllSyncCompletions.append(completion)
+        }
+        if isStoppingAllSyncs {
+            syncSlotsLock.unlock()
+            return
+        }
+        isStoppingAllSyncs = true
+
+        var helpers: [DbSyncHelper] = []
+        var seenHelpers = Set<ObjectIdentifier>()
+        for slot in syncSlots.values {
+            if let helper = slot.helper {
+                let identifier = ObjectIdentifier(helper)
+                if seenHelpers.insert(identifier).inserted {
+                    // Make cancellation visible while the slot lock still prevents a racing start.
+                    helper.requestCancellation()
+                    helpers.append(helper)
+                }
+            }
+            slot.running = false
+            slot.helper = nil
+            slot.pendingConfig = nil
+            slot.pendingEngine = nil
+            slot.pendingCompletions = []
+        }
+        syncSlots.removeAll()
+        syncSlotsLock.unlock()
+
+        guard helpers.isEmpty == false else {
+            DispatchQueue.main.async { finishStoppingAllSyncs() }
+            return
+        }
+
+        let group = DispatchGroup()
+        helpers.forEach { helper in
+            group.enter()
+            helper.cancel {
+                group.leave()
+            }
+        }
+        group.notify(queue: .main) {
+            finishStoppingAllSyncs()
+        }
+    }
+
+    private static func finishStoppingAllSyncs() {
+        syncSlotsLock.lock()
+        isStoppingAllSyncs = false
+        let completions = stopAllSyncCompletions
+        stopAllSyncCompletions = []
+        syncSlotsLock.unlock()
+        completions.forEach { $0() }
     }
 
     open override func close() {}
