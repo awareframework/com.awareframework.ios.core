@@ -68,6 +68,20 @@ public struct MySQLDirectSyncResult {
     }
 }
 
+private final class ContinuationResumeGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var hasResumed = false
+
+    func claim() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard hasResumed == false else { return false }
+        hasResumed = true
+        return true
+    }
+}
+
 public final class MySQLDirectClient {
 
     private let config: MySQLDirectSyncConfig
@@ -89,20 +103,17 @@ public final class MySQLDirectClient {
         connection = conn
 
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            var resumed = false
+            let resumeGate = ContinuationResumeGate()
             conn.stateUpdateHandler = { state in
                 switch state {
                 case .ready:
-                    guard !resumed else { return }
-                    resumed = true
+                    guard resumeGate.claim() else { return }
                     cont.resume()
                 case .failed(let error):
-                    guard !resumed else { return }
-                    resumed = true
+                    guard resumeGate.claim() else { return }
                     cont.resume(throwing: error)
                 case .cancelled:
-                    guard !resumed else { return }
-                    resumed = true
+                    guard resumeGate.claim() else { return }
                     cont.resume(throwing: MySQLDirectSyncError.connectionCancelled)
                 default:
                     break
