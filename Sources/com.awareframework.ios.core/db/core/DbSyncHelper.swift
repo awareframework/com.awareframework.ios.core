@@ -292,6 +292,35 @@ open class DbSyncHelper: NSObject {
     /// Host key for the learned request size limit
     private var limitHost: String { AwareUtils.cleanHostName(host) }
 
+    // MARK: Diagnostics (SyncDiagnostics)
+
+    /// Times of the running sync, summarized when it ends
+    private lazy var recorder = SyncRunRecorder(table: tableName, host: limitHost)
+    /// Preparation time of the request in flight, and whether it was prefetched
+    private var currentPrepareSeconds: TimeInterval = 0
+    private var currentPrefetched = false
+    /// The size limit the request in flight was chosen with
+    private var currentLimitBytes = 0
+    /// When the request in flight was sent
+    private var requestStartedAt: Date?
+    /// Parts of the request in flight, from URLSessionTaskMetrics
+    private var currentTimings: (connect: TimeInterval?, upload: TimeInterval?, server: TimeInterval?,
+                                 download: TimeInterval?)?
+    private var currentDeleteSeconds: TimeInterval = 0
+    /// The finished request, recorded once the rest before the next one is known
+    private var pendingMetrics: SyncBatchMetrics?
+
+    // MARK: Prefetch (DbSyncConfig.prefetchNextBatch)
+
+    /// The next request, chosen and built while the current one was in flight
+    private struct Prefetch {
+        let afterId: Int64
+        let limit: Int
+        let batch: Batch
+        let seconds: TimeInterval
+    }
+    private var prefetched: Prefetch?
+
     /// Run `work` on the sync queue, with a lower priority while the app is in the background
     private func onSyncQueue(after delay: TimeInterval = 0, _ work: @escaping () -> Void) {
         let item = DispatchWorkItem(qos: SyncAppState.shared.workQoS, flags: .enforceQoS, block: work)
@@ -656,10 +685,27 @@ open class DbSyncHelper: NSObject {
             }
         }
 
-        // Choose the rows of this request: as many as fit in the size limit (on the sync queue)
-        let started = Date()
-        let batch = selectBatch()
-        batchWorkSeconds = Date().timeIntervalSince(started)
+        if recorder.startedAt == nil { recorder.startedAt = Date() }
+
+        // Choose the rows of this request: as many as fit in the size limit (on the sync queue).
+        // A request prefetched while the previous one was in flight is used when it starts right
+        // after the uploaded rows and was chosen with the same limit.
+        let limit = SyncBatchLimit.current(host: limitHost, config: config)
+        let batch: Batch
+        if let p = prefetched, p.afterId == lastUploadedId, p.limit == limit {
+            batch = p.batch
+            batchWorkSeconds = 0
+            currentPrepareSeconds = p.seconds
+            currentPrefetched = true
+        } else {
+            let started = Date()
+            batch = selectBatch(afterId: lastUploadedId, limit: limit)
+            batchWorkSeconds = Date().timeIntervalSince(started)
+            currentPrepareSeconds = batchWorkSeconds
+            currentPrefetched = false
+        }
+        prefetched = nil
+        currentLimitBytes = limit
 
         if config.debug {
             logVerbose(
@@ -694,8 +740,7 @@ open class DbSyncHelper: NSObject {
     ///
     /// With `compactDataFormat` or `createHttpRequestBodyHandler` the body is not the sum of its rows,
     /// so it is built with `buildRequestBody(from:)` and rows are removed until it fits.
-    private func selectBatch() -> Batch {
-        let limit = SyncBatchLimit.current(host: limitHost, config: config)
+    private func selectBatch(afterId start: Int64, limit: Int) -> Batch {
         let maxRows = max(1, config.maxBatchRows)
         let chunk = max(1, min(config.batchSize, maxRows))
         let form = !usesNewAwareServerEndpoint
@@ -711,7 +756,7 @@ open class DbSyncHelper: NSObject {
             // Size with no rows: the envelope with an empty data array (see assembleBody)
             total = form ? formEnvelopeLength() : jsonEnvelope().utf8.count + ",\"data\":[]".utf8.count
         }
-        var afterId = lastUploadedId
+        var afterId = start
         var more = true
         var invalid = false
 
@@ -777,7 +822,7 @@ open class DbSyncHelper: NSObject {
         }
         if invalid {
             // Read the same rows again as dictionaries for buildRequestBody
-            rows = getUploadCandidates(lastUploadedId: lastUploadedId, limit: min(chunk, maxRows))
+            rows = getUploadCandidates(lastUploadedId: start, limit: min(chunk, maxRows))
             more = true
         }
         // Build with the general builder, and remove rows until the body fits
@@ -1089,6 +1134,9 @@ open class DbSyncHelper: NSObject {
      */
     private func handleSyncCompletion(success: Bool, error: Error?) {
         guard isStopRequested == false else { return }
+        prefetched = nil
+        recordPendingMetrics(rest: 0)
+        emitSummary(success: success)
         // Set final state
         if success {
             syncState = .completed
@@ -1138,6 +1186,7 @@ open class DbSyncHelper: NSObject {
         if config.debug {
             logVerbose(String(format: "Next batch in %.3f s (work %.3f s)", rest, batchWorkSeconds))
         }
+        recordPendingMetrics(rest: rest)
         onSyncQueue(after: rest) { [weak self] in
             guard self?.isStopRequested == false else { return }
             // Calculate and report progress
@@ -1216,6 +1265,7 @@ open class DbSyncHelper: NSObject {
         // If data is empty, process as sync completed
         if count == 0 {
             syncState = .completed
+            emitSummary(success: true)
             if self.config.debug {
                 logInfo("A sync process is done: No Data")
             }
@@ -1253,8 +1303,13 @@ open class DbSyncHelper: NSObject {
             // Build HTTP request body (unless it was built while choosing the rows)
             let started = Date()
             let requestBody = try prebuiltBody ?? buildRequestBody(from: rows ?? [])
-            batchWorkSeconds += Date().timeIntervalSince(started)
+            let buildSeconds = Date().timeIntervalSince(started)
+            batchWorkSeconds += buildSeconds
+            if !currentPrefetched { currentPrepareSeconds += buildSeconds }
             currentBodyBytes = requestBody.utf8.count
+            requestStartedAt = Date()
+            currentTimings = nil
+            currentDeleteSeconds = 0
 
             // Build HTTP request
             if let request = buildHTTPRequest(with: requestBody) {
@@ -1263,6 +1318,7 @@ open class DbSyncHelper: NSObject {
                     // Test mode should not leave synthetic URLSession tasks behind.
                     // A suspended task is later returned by getAllTasks() and can be
                     // cancelled as a real network failure during the next batch.
+                    schedulePrefetch(after: lastId, isLast: isLast)
                     handleSuccessfulUploadCompletion()
                     return
                 }
@@ -1286,6 +1342,9 @@ open class DbSyncHelper: NSObject {
                 // Send actual HTTP request
                 task.resume()
                 stopLock.unlock()
+
+                // Prepare the next request while this one is in flight
+                schedulePrefetch(after: lastId, isLast: isLast)
             }
         } catch {
             // Handle JSON serialization error
@@ -1294,6 +1353,8 @@ open class DbSyncHelper: NSObject {
             }
             // Stop sync on error and call callback
             syncState = .failed(error)
+            prefetched = nil
+            emitSummary(success: false)
             if let callback = self.completion {
                 DispatchQueue.main.async { [weak self] in
                     guard self?.isStopRequested == false else { return }
@@ -1323,11 +1384,14 @@ open class DbSyncHelper: NSObject {
         }
 
         if config.removeAfterSync {
+            let started = Date()
             removeUploadedCandidates(lastUploadedId: lastUploadedId, limit: config.batchSize)
+            currentDeleteSeconds = Date().timeIntervalSince(started)
         }
 
         updateLastUploadedId()
         receivedData = Data()
+        pendingMetrics = makeMetrics(success: true)
         handleUploadCompletion(responseState: true, error: nil)
     }
 
@@ -1528,6 +1592,9 @@ open class DbSyncHelper: NSObject {
         if !responseState, let delay = retryDelayAfterFailure(error: error) {
             invalidateSession(waitForTasks: false)
             receivedData = Data()
+            prefetched = nil
+            pendingMetrics = makeMetrics(success: false)
+            recordPendingMetrics(rest: delay, isRetryWait: true)
             onSyncQueue(after: delay) { [weak self] in
                 self?.performDataSync()
             }
@@ -1535,7 +1602,11 @@ open class DbSyncHelper: NSObject {
         }
         if responseState {
             adjustRetries = 0
-            SyncBatchLimit.recordSuccess(host: limitHost)
+            let networkSeconds = requestStartedAt.map { Date().timeIntervalSince($0) } ?? 0
+            if let grown = SyncBatchLimit.recordSuccess(host: limitHost, bodyBytes: currentBodyBytes,
+                                                        networkSeconds: networkSeconds, config: config) {
+                logInfo("Requests are full and fast; the size limit grows to \(grown) bytes")
+            }
         }
 
         // Debug output of server response
@@ -1565,7 +1636,8 @@ open class DbSyncHelper: NSObject {
             if config.removeAfterSync {
                 let started = Date()
                 removeUploadedCandidates(lastUploadedId: lastUploadedId, limit: config.batchSize)
-                batchWorkSeconds += Date().timeIntervalSince(started)
+                currentDeleteSeconds = Date().timeIntervalSince(started)
+                batchWorkSeconds += currentDeleteSeconds
             }
 
             // Finally update uploaded ID
@@ -1578,8 +1650,89 @@ open class DbSyncHelper: NSObject {
         // Clear received data buffer
         receivedData = Data()
 
+        pendingMetrics = makeMetrics(success: responseState)
+
         // Execute subsequent processing
         handleUploadCompletion(responseState: responseState, error: error)
+    }
+
+    /// Timings of the connection, the body, the server and the response (called before
+    /// `didCompleteWithError`)
+    open func urlSession(
+        _ session: URLSession, task: URLSessionTask, didFinishCollecting metrics: URLSessionTaskMetrics
+    ) {
+        guard let t = metrics.transactionMetrics.last else { return }
+        func span(_ a: Date?, _ b: Date?) -> TimeInterval? {
+            guard let a, let b else { return nil }
+            return max(0, b.timeIntervalSince(a))
+        }
+        // A reused connection has no connect dates: nothing was spent on connecting
+        let connect = t.isReusedConnection ? 0 : (span(t.fetchStartDate, t.connectEndDate) ?? 0)
+        currentTimings = (connect, span(t.requestStartDate, t.requestEndDate),
+                          span(t.requestEndDate, t.responseStartDate),
+                          span(t.responseStartDate, t.responseEndDate))
+    }
+
+    // MARK: - Diagnostics and prefetch
+
+    /// The metrics of the request that just ended
+    private func makeMetrics(success: Bool) -> SyncBatchMetrics {
+        let processInfo = ProcessInfo.processInfo
+        return SyncBatchMetrics(
+            table: tableName, host: limitHost, date: Date(), rows: currentNumOfCandidates,
+            bodyBytes: currentBodyBytes, limitBytes: currentLimitBytes,
+            prepareSeconds: currentPrepareSeconds, prefetched: currentPrefetched,
+            networkSeconds: config.test ? 0 : (requestStartedAt.map { Date().timeIntervalSince($0) } ?? 0),
+            connectSeconds: currentTimings?.connect, uploadSeconds: currentTimings?.upload,
+            serverSeconds: currentTimings?.server, downloadSeconds: currentTimings?.download,
+            deleteSeconds: currentDeleteSeconds, restSeconds: 0, statusCode: lastStatusCode,
+            success: success, background: SyncAppState.shared.isInBackground,
+            lowPower: processInfo.isLowPowerModeEnabled, thermalState: processInfo.thermalState)
+    }
+
+    /// Record the request that ended, with the rest (or retry wait) that follows it
+    private func recordPendingMetrics(rest: TimeInterval, isRetryWait: Bool = false) {
+        guard let m = pendingMetrics else { return }
+        pendingMetrics = nil
+        let metrics = SyncBatchMetrics(
+            table: m.table, host: m.host, date: m.date, rows: m.rows, bodyBytes: m.bodyBytes,
+            limitBytes: m.limitBytes, prepareSeconds: m.prepareSeconds, prefetched: m.prefetched,
+            networkSeconds: m.networkSeconds, connectSeconds: m.connectSeconds,
+            uploadSeconds: m.uploadSeconds, serverSeconds: m.serverSeconds,
+            downloadSeconds: m.downloadSeconds, deleteSeconds: m.deleteSeconds, restSeconds: rest,
+            statusCode: m.statusCode, success: m.success, background: m.background,
+            lowPower: m.lowPower, thermalState: m.thermalState)
+        recorder.add(metrics, isRetryWait: isRetryWait)
+        SyncDiagnostics.shared.record(metrics)
+        logInfo("Request: \(metrics)")
+    }
+
+    /// Publish the summary of the sync that ended and start a new one
+    private func emitSummary(success: Bool) {
+        if let summary = recorder.summary(success: success) {
+            SyncDiagnostics.shared.record(summary)
+            logInfo("Summary: \(summary)")
+        }
+        recorder = SyncRunRecorder(table: tableName, host: limitHost)
+    }
+
+    /// Choose and build the request after the rows ending with `lastId` on the sync queue, so it is
+    /// ready when the current request ends. The sync queue is serial, so this runs before the
+    /// response of the current request is handled.
+    private func schedulePrefetch(after lastId: Int64?, isLast: Bool) {
+        guard config.prefetchNextBatch, !isLast, let afterId = lastId, currentLimitBytes > 0 else { return }
+        let limit = currentLimitBytes
+        onSyncQueue { [weak self] in
+            guard let self, self.isStopRequested == false, self.prefetched == nil else { return }
+            let started = Date()
+            var batch = self.selectBatch(afterId: afterId, limit: limit)
+            guard batch.count > 0 else { return }
+            if batch.body == nil, let rows = batch.rows {
+                batch.body = try? self.buildRequestBody(from: rows)
+            }
+            self.prefetched = Prefetch(afterId: afterId, limit: limit, batch: batch,
+                                       seconds: Date().timeIntervalSince(started))
+        }
     }
 
     /// Whether to send the batch again after a failure, and after how long.

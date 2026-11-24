@@ -12,5 +12,7 @@ public extension Notification.Name{
         public static let dbSyncRequest = Notification.Name("AwareDBSyncRequest")
         public static let dbSyncStopRequest = Notification.Name("AwareDBSyncStopRequest")
         public static let dbSyncStopCompletion = Notification.Name("AwareDBSyncStopCompletion")
+        /// Posted when a sync of a table ends. `object` is the `SyncRunSummary`.
+        public static let dbSyncDiagnostics = Notification.Name("AwareDBSyncDiagnostics")
     }
 }

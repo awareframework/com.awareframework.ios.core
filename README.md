@@ -324,11 +324,13 @@ Per-table upload settings, used by `DbSyncHelper`.
 | `serverType: ServerType` | `DbSyncConfig.defaultServerType` (`.aware_micro`) | Server protocol; selects the upload URL (see [Upload URL](#upload-url)). |
 | `studyNumber: Int` | `DbSyncConfig.defaultStudyNumber` (`1`) | Study number in the upload URL. |
 | `studyKey: String` | `DbSyncConfig.defaultStudyKey` (`""`) | Study key in the upload URL. |
-| `maxBatchBytes: Int?` | `nil` (by server type) | Largest request body in bytes. A request holds as many rows as fit. `nil` chooses 4 MB for AWARE Micro (Google App Engine accepts up to 32 MB) and 900 KB for other servers (below the nginx default of 1 MB). See [Request size](#request-size). Dictionary key: `"maxBatchBytes"`. |
-| `maxBatchRows: Int` | `20000` | Largest number of rows per request. Dictionary key: `"maxBatchRows"`. |
+| `maxBatchBytes: Int?` | `DbSyncConfig.defaultMaxBatchBytes` (`nil`) | Largest request body in bytes. A request holds as many rows as fit. `nil` is 4 MB for every server type (Google App Engine accepts up to 32 MB; up to 1.7 it was 900 KB for servers other than AWARE Micro). See [Request size](#request-size). Dictionary key: `"maxBatchBytes"`. |
+| `maxBatchBytesCeiling: Int?` | `DbSyncConfig.defaultMaxBatchBytesCeiling` (`nil`) | Largest size the limit grows to while requests are full and fast. `nil` is 8 MB. Set it to `maxBatchBytes` to turn growth off. Dictionary key: `"maxBatchBytesCeiling"`. |
+| `maxBatchRows: Int` | `DbSyncConfig.defaultMaxBatchRows` (`20000`) | Largest number of rows per request. Dictionary key: `"maxBatchRows"`. |
+| `prefetchNextBatch: Bool` | `DbSyncConfig.defaultPrefetchNextBatch` (`true`) | Choose and build the next request while the current one is in flight, so the device and the server work at the same time. Dictionary key: `"prefetchNextBatch"`. |
 | `batchSize: Int` | `1000` | Rows read from the database at a time while a request is built. (Up to 1.6 it was the number of rows per request; requests are now sized by `maxBatchBytes`.) |
 | `batchInterval: TimeInterval` | `0` | Shortest rest between requests, in seconds. 1.6 always waited 0.1 s; set `0.1` for that behaviour. |
-| `cpuRestRatio: Double` | `1` | Rest between requests as a multiple of the CPU time the last request took to prepare (reading rows, building the body, deleting uploaded rows), while the app is in the foreground. `1` keeps a sync at about half of one CPU core. See [Pacing](#pacing). |
+| `cpuRestRatio: Double` | `DbSyncConfig.defaultCpuRestRatio` (`1`) | Rest between requests as a multiple of the CPU time the last request took to prepare (reading rows, building the body, deleting uploaded rows), while the app is in the foreground. `1` keeps a sync at about half of one CPU core. See [Pacing](#pacing). |
 | `backgroundCpuRestRatio: Double` | `3` | The same while the app is in the background, where iOS may stop an app that keeps the CPU busy. |
 | `removeAfterSync: Bool` | `true` | Delete uploaded rows from the local database once they are older than `keepDataAfterSync`. Rows that have not been uploaded are never deleted. Set `false` to keep every row. |
 | `keepDataAfterSync: TimeInterval` | `86400` (one day) | Seconds to keep uploaded rows on the device, counted from each row's `timestamp`. `0` deletes them right after upload. Negative values are ignored. Dictionary key: `"keepDataAfterSync"`. |
@@ -347,6 +349,8 @@ Per-table upload settings, used by `DbSyncHelper`.
 `copy()` returns a new `DbSyncConfig` with the same values (handlers and the queue are shared). A sensor that uploads several tables should start each table's config from `syncConfig.copy()` and then change only what differs per table, such as `completionHandler` and `dispatchQueue`, so that no setting is lost.
 
 All settings can also be given as a dictionary with `DbSyncConfig(_:)` or `set(config:)`, e.g. `["batchSize": 500, "studyKey": "my-study-key"]`.
+
+The `DbSyncConfig.default…` static properties set the values of configs created afterwards, so an app can change the request size and pacing of every sensor at once (sensors create their configs themselves). Set them before the sensors are created, or also set the properties of `sensor.syncConfig`.
 
 ---
 
@@ -369,8 +373,9 @@ Each request holds as many rows as fit in the size limit, in the form the server
 
 | Situation | What the sync does |
 |---|---|
-| Default | `maxBatchBytes`, or 4 MB (AWARE Micro) / 900 KB (other servers) |
-| The server answers 413 | Half of the rejected size becomes the host's limit, saved in `UserDefaults` (`aware.sync.max_batch_bytes.<host>`), and the same rows are sent again right away. A server with nginx's default 1 MB limit costs two rejected requests once (4 MB, 2 MB), then every request fits. |
+| Default | `maxBatchBytes`, or 4 MB, for every server type (the PHP version of the AWARE server is retired; its endpoints are served by Flask) |
+| Requests are full and fast | After 3 requests in a row that filled at least 80 % of the limit and finished within 10 s, the limit grows by half, up to `maxBatchBytesCeiling` (8 MB by default), and is saved (`aware.sync.grown_batch_bytes.<host>`). Like `AWAREFetchSizeAdjuster` of AWAREFramework-iOS 1.x. |
+| The server answers 413 | Half of the rejected size becomes the host's limit, saved in `UserDefaults` (`aware.sync.max_batch_bytes.<host>`), and the same rows are sent again right away. A server with nginx's default 1 MB limit costs two rejected requests once (4 MB, 2 MB), then every request fits. The limit grows back by the rule above, but never above 90 % of the smallest size the host rejected (`aware.sync.rejected_batch_bytes.<host>`). |
 | A request times out | The limit is halved for this run of the app and the rows are sent again; after 20 successful requests in a row it grows back by half, up to the default. |
 | 429 or 503 | Wait for `Retry-After` (or 5, 10, 20 s, at most 120 s) and send again, up to 3 times. |
 
@@ -378,9 +383,15 @@ Each request holds as many rows as fit in the size limit, in the form the server
 
 With `SQLiteEngine`, each row is written as JSON straight from the values SQLite returns (`Engine.fetchUploadJSON(afterId:limit:omitting:)`), without making a dictionary for the row first. The values are the same as before: NULL columns are left out, and a REAL is written with the shortest text that reads back as the same Double, so no precision is lost. (SQLite's own `json_object()` is not used: it keeps only 15 significant digits, so a millisecond timestamp stored as REAL would lose its last digits.) A row JSON cannot hold (a BLOB, or infinity or NaN) goes through the general builder as before. A `DbSyncHelper` subclass that overrides `getUploadCandidates(lastUploadedId:limit:)` to change the rows must also override `getUploadCandidateJSON(lastUploadedId:limit:)` (returning `nil` is enough).
 
+### Diagnostics
+
+`SyncDiagnostics.shared` tells why an upload is slow. For each request it records (`SyncBatchMetrics`) the rows and bytes, the time to read rows and build the body (`prepare`), the network time split by `URLSessionTaskMetrics` into connecting, sending the body and waiting for the server (`server`), the time to delete uploaded rows, and the rest or retry wait that followed. When the sync of a table ends, it makes a `SyncRunSummary` with the share of each part and the largest one (`bottleneck`), keeps it (`latestSummaries()`), and posts `Notification.Name.Aware.dbSyncDiagnostics`. `report()` gives a text report. With `debug`, each request and summary is also logged; `SyncDiagnostics.shared.printsToConsole = true` logs them without `debug`.
+
 ### Pacing
 
 All sync work (reading rows, building requests, the URLSession callbacks, deleting uploaded rows) runs on a serial queue per table, never on the main thread, so a sync does not freeze the UI. Completion and progress handlers are still called on the main thread.
+
+With `prefetchNextBatch`, the next request is chosen and built while the current one is in flight, on the same serial queue. It is used only when it starts right after the rows the server accepted and was chosen with the same size limit; otherwise (a 413, a timeout, a failure) it is discarded and chosen again.
 
 Between requests the sync rests for `cpuRestRatio` (foreground) or `backgroundCpuRestRatio` (background) times the CPU time the last request took to prepare. Waiting for the server is not counted, so on a slow network the sync does not wait longer than needed, and on a fast network it leaves the CPU idle at least half of the time (three quarters in the background). The work also runs with a lower priority in the background (`.background` instead of `.utility`). The rest is doubled in Low Power Mode, at least 5 s when the device is hot (`thermalState` serious) and 30 s when critical, and at most 120 s.
 

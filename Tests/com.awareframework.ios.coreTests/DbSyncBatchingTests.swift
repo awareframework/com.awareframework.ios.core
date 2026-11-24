@@ -163,7 +163,9 @@ final class DbSyncBatchingTests: XCTestCase {
         let micro = DbSyncConfig(); micro.serverType = .aware_micro
         let legacy = DbSyncConfig(); legacy.serverType = .aware
         XCTAssertEqual(SyncBatchLimit.configured(micro), 4_000_000)
-        XCTAssertEqual(SyncBatchLimit.configured(legacy), 900_000)
+        XCTAssertEqual(SyncBatchLimit.configured(legacy), 4_000_000, "the same for every server type")
+        XCTAssertEqual(SyncBatchLimit.ceiling(micro), 8_000_000)
+        XCTAssertEqual(SyncBatchLimit.ceiling(legacy), 8_000_000)
         legacy.maxBatchBytes = 2_000_000
         XCTAssertEqual(SyncBatchLimit.configured(legacy), 2_000_000)
     }
@@ -194,6 +196,95 @@ final class DbSyncBatchingTests: XCTestCase {
         XCTAssertEqual(SyncBatchLimit.current(host: "t", config: c), 3_000_000)
         for _ in 0..<(SyncBatchLimit.growAfterSuccesses * 3) { SyncBatchLimit.recordSuccess(host: "t") }
         XCTAssertEqual(SyncBatchLimit.current(host: "t", config: c), 4_000_000, "not above the configured limit")
+    }
+
+    // MARK: - Growth (like AWAREFetchSizeAdjuster)
+
+    private func fullSuccesses(_ n: Int, host: String, config c: DbSyncConfig, seconds: TimeInterval = 1) {
+        for _ in 0..<n {
+            let limit = SyncBatchLimit.current(host: host, config: c)
+            SyncBatchLimit.recordSuccess(host: host, bodyBytes: limit, networkSeconds: seconds, config: c)
+        }
+    }
+
+    func testLimitGrowsAfterFullFastRequestsUpToTheCeiling() {
+        let c = DbSyncConfig(); c.serverType = .aware_micro
+        fullSuccesses(SyncBatchLimit.growAfterFullSuccesses - 1, host: "g", config: c)
+        XCTAssertEqual(SyncBatchLimit.current(host: "g", config: c), 4_000_000, "not yet")
+        fullSuccesses(1, host: "g", config: c)
+        XCTAssertEqual(SyncBatchLimit.current(host: "g", config: c), 6_000_000, "grows by half")
+        XCTAssertEqual(UserDefaults.standard.integer(forKey: SyncBatchLimit.grownKeyPrefix + "g"), 6_000_000, "saved")
+        fullSuccesses(SyncBatchLimit.growAfterFullSuccesses * 10, host: "g", config: c)
+        XCTAssertEqual(SyncBatchLimit.current(host: "g", config: c), SyncBatchLimit.microCeilingBytes, "up to the ceiling")
+        c.maxBatchBytesCeiling = 5_000_000
+        XCTAssertEqual(SyncBatchLimit.current(host: "g", config: c), 5_000_000, "a lower ceiling applies at once")
+    }
+
+    func testLimitDoesNotGrowForSmallOrSlowRequests() {
+        let c = DbSyncConfig(); c.serverType = .aware_micro
+        for _ in 0..<20 {
+            SyncBatchLimit.recordSuccess(host: "s", bodyBytes: 1_000_000, networkSeconds: 1, config: c)
+        }
+        XCTAssertEqual(SyncBatchLimit.current(host: "s", config: c), 4_000_000, "the limit was not what held requests back")
+        fullSuccesses(20, host: "s", config: c, seconds: SyncBatchLimit.growMaxNetworkSeconds + 1)
+        XCTAssertEqual(SyncBatchLimit.current(host: "s", config: c), 4_000_000, "slow network")
+        // The AWARE server (Flask) grows like AWARE Micro
+        let legacy = DbSyncConfig(); legacy.serverType = .aware
+        fullSuccesses(SyncBatchLimit.growAfterFullSuccesses, host: "l", config: legacy)
+        XCTAssertEqual(SyncBatchLimit.current(host: "l", config: legacy), 6_000_000)
+        legacy.maxBatchBytesCeiling = legacy.maxBatchBytes ?? SyncBatchLimit.defaultBytes
+        XCTAssertEqual(SyncBatchLimit.current(host: "l", config: legacy), 4_000_000,
+                       "a ceiling equal to the size turns growth off")
+    }
+
+    func testLimitLearnedFrom413GrowsBackBelowTheRejectedSize() {
+        let c = DbSyncConfig(); c.serverType = .aware_micro
+        SyncBatchLimit.recordTooLarge(host: "r", bodyBytes: 3_000_000)
+        XCTAssertEqual(SyncBatchLimit.current(host: "r", config: c), 1_500_000)
+        fullSuccesses(SyncBatchLimit.growAfterFullSuccesses * 10, host: "r", config: c)
+        XCTAssertEqual(SyncBatchLimit.current(host: "r", config: c), 2_700_000, "90 % of the rejected size")
+    }
+
+    // MARK: - Prefetch and diagnostics
+
+    func testPrefetchSendsEveryRowOnceAndRecordsDiagnostics() {
+        SyncDiagnostics.shared.reset()
+        engine.mockData = rows(3000)
+        config.maxBatchBytes = 50_000
+        config.prefetchNextBatch = true
+        let (bodies, _) = sync(server: .aware_micro)
+        let ids = bodies.flatMap(jsonRows).compactMap { ($0["id"] as? NSNumber)?.int64Value }
+        XCTAssertEqual(ids, (1...3000).map(Int64.init), "every row once, in order")
+
+        let batches = SyncDiagnostics.shared.recentBatches(table: table)
+        XCTAssertEqual(batches.count, bodies.count)
+        XCTAssertTrue(batches.dropFirst().allSatisfy(\.prefetched), "requests after the first were prepared in advance")
+        XCTAssertEqual(batches.map(\.rows).reduce(0, +), 3000)
+        let summary = SyncDiagnostics.shared.latestSummary(table: table)
+        XCTAssertEqual(summary?.rows, 3000)
+        XCTAssertEqual(summary?.batches, bodies.count)
+        XCTAssertTrue(summary?.success ?? false)
+    }
+
+    func testWithoutPrefetchTheSameRowsAreSent() {
+        engine.mockData = rows(1200)
+        config.maxBatchBytes = 30_000
+        config.prefetchNextBatch = false
+        let (bodies, _) = sync(server: .aware_micro)
+        let ids = bodies.flatMap(jsonRows).compactMap { ($0["id"] as? NSNumber)?.int64Value }
+        XCTAssertEqual(ids, (1...1200).map(Int64.init))
+    }
+
+    func testSummaryNamesTheLargestPart() {
+        let start = Date(timeIntervalSince1970: 0)
+        let s = SyncRunSummary(
+            table: "t", host: "h", startedAt: start, endedAt: start.addingTimeInterval(10), success: true,
+            batches: 5, failedRequests: 0, rows: 100, bytes: 1_000_000, prepareSeconds: 1,
+            overlappedPrepareSeconds: 0, networkSeconds: 8, connectSeconds: 0.5, uploadSeconds: 1.5,
+            serverSeconds: 5.5, deleteSeconds: 0.5, restSeconds: 0.5, retryWaitSeconds: 0,
+            lastLimitBytes: 4_000_000, backgroundBatches: 0)
+        XCTAssertEqual(s.bottleneck, .server)
+        XCTAssertEqual(s.breakdown.first?.1 ?? 0, 0.6, accuracy: 0.01, "server 5.5 s + unmeasured network 0.5 s")
     }
 
     // MARK: - Pacing
