@@ -11,6 +11,8 @@ public enum ServerType {
     case aware
     case aware_micro
     case aware_light
+    /// AWARE Hub: JSON uploads, compressed
+    case aware_hub
 }
 
 public protocol EngineProtocal {
@@ -149,6 +151,38 @@ open class Engine: EngineProtocal {
     /// The sync uses this to build a request without making a dictionary for every row. Returns `nil`
     /// when the engine cannot do this; the sync then uses `fetch(filter:limit:)`.
     open func fetchUploadJSON(afterId: Int64, limit: Int, omitting: Set<String>) -> [UploadRowJSON]? { nil }
+
+    /// The rows of `fetchUploadJSON(afterId:limit:omitting:)`, written into `buffer` (appended)
+    /// instead of one string per row. The sync builds its requests from these bytes.
+    /// The default uses `fetchUploadJSON`; `SQLiteEngine` writes the bytes straight from SQLite.
+    open func appendUploadJSON(afterId: Int64, limit: Int, omitting: Set<String>,
+                               to buffer: inout [UInt8]) -> [UploadRowSpan]? {
+        guard let rows = fetchUploadJSON(afterId: afterId, limit: limit, omitting: omitting) else { return nil }
+        return rows.map { row in
+            guard let json = row.json else { return UploadRowSpan(id: row.id, range: nil) }
+            let start = buffer.count
+            buffer.append(contentsOf: json.utf8)
+            return UploadRowSpan(id: row.id, range: start..<buffer.count)
+        }
+    }
+
+    /// Times of the last `fetchUploadJSON` call, for `SyncDiagnostics` (nil when not measured).
+    /// Read it right after the call, on the same queue.
+    public var lastUploadJSONTiming: UploadJSONTiming?
+}
+
+/// Where the time of `Engine.fetchUploadJSON` went.
+public struct UploadJSONTiming {
+    /// Waiting for the database queue (other reads and the sensors' writes use it too)
+    public var queueWait: TimeInterval = 0
+    /// Stepping through the rows in SQLite and decoding their values
+    public var read: TimeInterval = 0
+    /// Writing each row as JSON
+    public var encode: TimeInterval = 0
+    /// CPU time of the thread while it read and wrote the rows
+    public var cpu: TimeInterval = 0
+
+    public init() {}
 }
 
 /// A row ready for upload: its ID and its JSON object, or `nil` when the row cannot be written as

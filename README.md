@@ -191,7 +191,6 @@ let syncConfig = DbSyncConfig()
 syncConfig.maxBatchBytes    = 4_000_000   // optional; by server type when not set
 syncConfig.removeAfterSync  = true
 syncConfig.keepPeriod       = .day   // or keepDataAfterSync = 86400 (seconds)
-syncConfig.compactDataFormat = false
 syncConfig.debug            = true
 syncConfig.debugLevel       = .verbose
 syncConfig.progressHandler  = { progress, error in
@@ -324,7 +323,7 @@ Per-table upload settings, used by `DbSyncHelper`.
 | `serverType: ServerType` | `DbSyncConfig.defaultServerType` (`.aware_micro`) | Server protocol; selects the upload URL (see [Upload URL](#upload-url)). |
 | `studyNumber: Int` | `DbSyncConfig.defaultStudyNumber` (`1`) | Study number in the upload URL. |
 | `studyKey: String` | `DbSyncConfig.defaultStudyKey` (`""`) | Study key in the upload URL. |
-| `maxBatchBytes: Int?` | `DbSyncConfig.defaultMaxBatchBytes` (`nil`) | Largest request body in bytes. A request holds as many rows as fit. `nil` is 4 MB for every server type (Google App Engine accepts up to 32 MB; up to 1.7 it was 900 KB for servers other than AWARE Micro). See [Request size](#request-size). Dictionary key: `"maxBatchBytes"`. |
+| `maxBatchBytes: Int?` | `DbSyncConfig.defaultMaxBatchBytes` (`nil`) | Largest request body in bytes. A request holds as many rows as fit. `nil` is 500 KB for every server type: Flask's default form field limit (Werkzeug 3.1 `MAX_FORM_MEMORY_SIZE`), so a server with default settings accepts the first requests (up to 1.7: 4 MB for AWARE Micro, 900 KB for other servers). See [Request size](#request-size). Dictionary key: `"maxBatchBytes"`. |
 | `maxBatchBytesCeiling: Int?` | `DbSyncConfig.defaultMaxBatchBytesCeiling` (`nil`) | Largest size the limit grows to while requests are full and fast. `nil` is 8 MB. Set it to `maxBatchBytes` to turn growth off. Dictionary key: `"maxBatchBytesCeiling"`. |
 | `maxBatchRows: Int` | `DbSyncConfig.defaultMaxBatchRows` (`20000`) | Largest number of rows per request. Dictionary key: `"maxBatchRows"`. |
 | `prefetchNextBatch: Bool` | `DbSyncConfig.defaultPrefetchNextBatch` (`true`) | Choose and build the next request while the current one is in flight, so the device and the server work at the same time. Dictionary key: `"prefetchNextBatch"`. |
@@ -335,7 +334,7 @@ Per-table upload settings, used by `DbSyncHelper`.
 | `removeAfterSync: Bool` | `true` | Delete uploaded rows from the local database once they are older than `keepDataAfterSync`. Rows that have not been uploaded are never deleted. Set `false` to keep every row. |
 | `keepDataAfterSync: TimeInterval` | `86400` (one day) | Seconds to keep uploaded rows on the device, counted from each row's `timestamp`. `0` deletes them right after upload. Negative values are ignored. Dictionary key: `"keepDataAfterSync"`. |
 | `keepPeriod: DbSyncConfig.KeepPeriod?` | `.day` | `keepDataAfterSync` as a period: `.immediately` (0), `.hour`, `.day`, `.week`, `.month` (30 days). Setting it sets `keepDataAfterSync`; reading it gives `nil` for other values. Dictionary key: `"keepPeriod"` (e.g. `"week"`). |
-| `compactDataFormat: Bool` | `DbSyncConfig.defaultCompactDataFormat` (`false`) | Send columns as arrays, and omit `os`, `jsonVersion`, `deviceId` and `timezone`, to reduce payload size. |
+| `compactDataFormat: Bool` | — | Deprecated: the compact data format was removed. Setting it has no effect; rows are always sent one object per row. |
 | `backgroundSession: Bool` | `false` | Use a background `URLSession` (`URLSessionConfiguration.background`). |
 | `debug: Bool` | `false` | Enable debug logging. |
 | `debugLevel: DbSyncDebugLevel` | `.info` | Log verbosity: `.none`, `.error`, `.warning`, `.info`, `.verbose`, `.trace`. |
@@ -373,13 +372,13 @@ Each request holds as many rows as fit in the size limit, in the form the server
 
 | Situation | What the sync does |
 |---|---|
-| Default | `maxBatchBytes`, or 4 MB, for every server type (the PHP version of the AWARE server is retired; its endpoints are served by Flask) |
+| Default | `maxBatchBytes`, or 500 KB, for every server type: Flask's default form field limit (the PHP version of the AWARE server is retired; its endpoints are served by Flask). A server with a higher limit gets larger requests by growth. |
 | Requests are full and fast | After 3 requests in a row that filled at least 80 % of the limit and finished within 10 s, the limit grows by half, up to `maxBatchBytesCeiling` (8 MB by default), and is saved (`aware.sync.grown_batch_bytes.<host>`). Like `AWAREFetchSizeAdjuster` of AWAREFramework-iOS 1.x. |
-| The server answers 413 | Half of the rejected size becomes the host's limit, saved in `UserDefaults` (`aware.sync.max_batch_bytes.<host>`), and the same rows are sent again right away. A server with nginx's default 1 MB limit costs two rejected requests once (4 MB, 2 MB), then every request fits. The limit grows back by the rule above, but never above 90 % of the smallest size the host rejected (`aware.sync.rejected_batch_bytes.<host>`). |
+| The server answers 413 | Half of the rejected size becomes the host's limit, saved in `UserDefaults` (`aware.sync.max_batch_bytes.<host>`), and the same rows are sent again right away. For example, a server with nginx's default 1 MB limit answers 413 once while the size grows past 1 MB, then every request fits. The limit grows back by the rule above, but never above 90 % of the smallest size the host rejected (`aware.sync.rejected_batch_bytes.<host>`). |
 | A request times out | The limit is halved for this run of the app and the rows are sent again; after 20 successful requests in a row it grows back by half, up to the default. |
 | 429 or 503 | Wait for `Retry-After` (or 5, 10, 20 s, at most 120 s) and send again, up to 3 times. |
 
-`SyncBatchLimit.reset(host:)` forgets what was learned. With `compactDataFormat` or `createHttpRequestBodyHandler`, the body is built as a whole and rows are removed until it fits.
+`SyncBatchLimit.reset(host:)` forgets what was learned. With `createHttpRequestBodyHandler`, the body is built as a whole and rows are removed until it fits.
 
 With `SQLiteEngine`, each row is written as JSON straight from the values SQLite returns (`Engine.fetchUploadJSON(afterId:limit:omitting:)`), without making a dictionary for the row first. The values are the same as before: NULL columns are left out, and a REAL is written with the shortest text that reads back as the same Double, so no precision is lost. (SQLite's own `json_object()` is not used: it keeps only 15 significant digits, so a millisecond timestamp stored as REAL would lose its last digits.) A row JSON cannot hold (a BLOB, or infinity or NaN) goes through the general builder as before. A `DbSyncHelper` subclass that overrides `getUploadCandidates(lastUploadedId:limit:)` to change the rows must also override `getUploadCandidateJSON(lastUploadedId:limit:)` (returning `nil` is enough).
 

@@ -23,6 +23,7 @@ let package = Package(
             dependencies: [
                 .product(name: "SwiftyJSON", package: "SwiftyJSON"),
                 .product(name: "GRDB", package: "GRDB.swift"),
+                .product(name: "GRDBSQLite", package: "GRDB.swift"),
                 .product(name: "Reachability", package: "Reachability.swift", condition: .when(platforms: [.iOS]))
             ]
         ),

@@ -55,10 +55,9 @@ final class DbSyncBatchingTests: XCTestCase {
     }
 
     /// Run a sync to the end and return the request bodies it sent
-    private func sync(server: ServerType, compact: Bool = false, bodyHandler: Bool = false,
+    private func sync(server: ServerType, bodyHandler: Bool = false,
                       file: StaticString = #filePath, line: UInt = #line) -> (bodies: [Data], helper: DbSyncHelper) {
         config.serverType = server
-        config.compactDataFormat = compact
         let helper = DbSyncHelper(engine: engine, host: host, tableName: table, config: config)
         var bodies: [Data] = []
         let lock = NSLock()
@@ -129,14 +128,9 @@ final class DbSyncBatchingTests: XCTestCase {
         XCTAssertEqual(ids, (1...1500).map(Int64.init))
     }
 
-    func testCompactFormatAndBodyHandlerStayWithinLimit() {
+    func testBodyHandlerStaysWithinLimit() {
         engine.mockData = rows(2000)
         config.maxBatchBytes = 40_000
-        let compact = sync(server: .aware_micro, compact: true).bodies
-        XCTAssertGreaterThan(compact.count, 1)
-        compact.forEach { XCTAssertLessThanOrEqual($0.count, 40_000) }
-
-        DbSyncUtils.clearLastUploadedId(for: table)
         let handled = sync(server: .aware_micro, bodyHandler: true).bodies
         handled.forEach { XCTAssertLessThanOrEqual($0.count, 40_000) }
         XCTAssertEqual(handled.flatMap(jsonRows).count, 2000)
@@ -162,8 +156,8 @@ final class DbSyncBatchingTests: XCTestCase {
     func testDefaultLimitByServerType() {
         let micro = DbSyncConfig(); micro.serverType = .aware_micro
         let legacy = DbSyncConfig(); legacy.serverType = .aware
-        XCTAssertEqual(SyncBatchLimit.configured(micro), 4_000_000)
-        XCTAssertEqual(SyncBatchLimit.configured(legacy), 4_000_000, "the same for every server type")
+        XCTAssertEqual(SyncBatchLimit.configured(micro), 500_000, "Flask's default form field limit")
+        XCTAssertEqual(SyncBatchLimit.configured(legacy), 500_000, "the same for every server type")
         XCTAssertEqual(SyncBatchLimit.ceiling(micro), 8_000_000)
         XCTAssertEqual(SyncBatchLimit.ceiling(legacy), 8_000_000)
         legacy.maxBatchBytes = 2_000_000
@@ -174,28 +168,28 @@ final class DbSyncBatchingTests: XCTestCase {
 
     func testTooLargeHalvesAndIsRemembered() {
         let c = DbSyncConfig(); c.serverType = .aware_micro
-        XCTAssertEqual(SyncBatchLimit.current(host: "h1", config: c), 4_000_000)
-        XCTAssertEqual(SyncBatchLimit.recordTooLarge(host: "h1", bodyBytes: 4_000_000), 2_000_000)
-        SyncBatchLimit.recordTooLarge(host: "h1", bodyBytes: 2_000_000)
-        XCTAssertEqual(SyncBatchLimit.current(host: "h1", config: c), 1_000_000, "4 MB -> 2 MB -> 1 MB")
-        XCTAssertEqual(UserDefaults.standard.integer(forKey: SyncBatchLimit.keyPrefix + "h1"), 1_000_000, "saved")
-        XCTAssertEqual(SyncBatchLimit.current(host: "other", config: c), 4_000_000, "per host")
+        XCTAssertEqual(SyncBatchLimit.current(host: "h1", config: c), 500_000)
+        XCTAssertEqual(SyncBatchLimit.recordTooLarge(host: "h1", bodyBytes: 500_000), 250_000)
+        SyncBatchLimit.recordTooLarge(host: "h1", bodyBytes: 250_000)
+        XCTAssertEqual(SyncBatchLimit.current(host: "h1", config: c), 125_000, "500 KB -> 250 KB -> 125 KB")
+        XCTAssertEqual(UserDefaults.standard.integer(forKey: SyncBatchLimit.keyPrefix + "h1"), 125_000, "saved")
+        XCTAssertEqual(SyncBatchLimit.current(host: "other", config: c), 500_000, "per host")
         // Successes do not raise a limit learned from 413
         for _ in 0..<100 { SyncBatchLimit.recordSuccess(host: "h1") }
-        XCTAssertEqual(SyncBatchLimit.current(host: "h1", config: c), 1_000_000)
+        XCTAssertEqual(SyncBatchLimit.current(host: "h1", config: c), 125_000)
         SyncBatchLimit.recordTooLarge(host: "h1", bodyBytes: 10)
         XCTAssertEqual(SyncBatchLimit.current(host: "h1", config: c), SyncBatchLimit.minimumBytes, "never below the minimum")
     }
 
     func testTimeoutLimitGrowsBack() {
         let c = DbSyncConfig(); c.serverType = .aware_micro
-        SyncBatchLimit.recordTimeout(host: "t", bodyBytes: 4_000_000)
-        XCTAssertEqual(SyncBatchLimit.current(host: "t", config: c), 2_000_000)
+        SyncBatchLimit.recordTimeout(host: "t", bodyBytes: 500_000)
+        XCTAssertEqual(SyncBatchLimit.current(host: "t", config: c), 250_000)
         XCTAssertEqual(UserDefaults.standard.integer(forKey: SyncBatchLimit.keyPrefix + "t"), 0, "not saved")
         for _ in 0..<SyncBatchLimit.growAfterSuccesses { SyncBatchLimit.recordSuccess(host: "t") }
-        XCTAssertEqual(SyncBatchLimit.current(host: "t", config: c), 3_000_000)
+        XCTAssertEqual(SyncBatchLimit.current(host: "t", config: c), 375_000)
         for _ in 0..<(SyncBatchLimit.growAfterSuccesses * 3) { SyncBatchLimit.recordSuccess(host: "t") }
-        XCTAssertEqual(SyncBatchLimit.current(host: "t", config: c), 4_000_000, "not above the configured limit")
+        XCTAssertEqual(SyncBatchLimit.current(host: "t", config: c), 500_000, "not above the configured limit")
     }
 
     // MARK: - Growth (like AWAREFetchSizeAdjuster)
@@ -210,39 +204,59 @@ final class DbSyncBatchingTests: XCTestCase {
     func testLimitGrowsAfterFullFastRequestsUpToTheCeiling() {
         let c = DbSyncConfig(); c.serverType = .aware_micro
         fullSuccesses(SyncBatchLimit.growAfterFullSuccesses - 1, host: "g", config: c)
-        XCTAssertEqual(SyncBatchLimit.current(host: "g", config: c), 4_000_000, "not yet")
+        XCTAssertEqual(SyncBatchLimit.current(host: "g", config: c), 500_000, "not yet")
         fullSuccesses(1, host: "g", config: c)
-        XCTAssertEqual(SyncBatchLimit.current(host: "g", config: c), 6_000_000, "grows by half")
-        XCTAssertEqual(UserDefaults.standard.integer(forKey: SyncBatchLimit.grownKeyPrefix + "g"), 6_000_000, "saved")
-        fullSuccesses(SyncBatchLimit.growAfterFullSuccesses * 10, host: "g", config: c)
-        XCTAssertEqual(SyncBatchLimit.current(host: "g", config: c), SyncBatchLimit.microCeilingBytes, "up to the ceiling")
-        c.maxBatchBytesCeiling = 5_000_000
-        XCTAssertEqual(SyncBatchLimit.current(host: "g", config: c), 5_000_000, "a lower ceiling applies at once")
+        XCTAssertEqual(SyncBatchLimit.current(host: "g", config: c), 750_000, "grows by half")
+        XCTAssertEqual(UserDefaults.standard.integer(forKey: SyncBatchLimit.grownKeyPrefix + "g"), 750_000, "saved")
+        fullSuccesses(SyncBatchLimit.growAfterFullSuccesses * 20, host: "g", config: c)
+        XCTAssertEqual(SyncBatchLimit.current(host: "g", config: c), SyncBatchLimit.defaultCeilingBytes, "up to the ceiling")
+        c.maxBatchBytesCeiling = 600_000
+        XCTAssertEqual(SyncBatchLimit.current(host: "g", config: c), 600_000, "a lower ceiling applies at once")
     }
 
     func testLimitDoesNotGrowForSmallOrSlowRequests() {
         let c = DbSyncConfig(); c.serverType = .aware_micro
         for _ in 0..<20 {
-            SyncBatchLimit.recordSuccess(host: "s", bodyBytes: 1_000_000, networkSeconds: 1, config: c)
+            SyncBatchLimit.recordSuccess(host: "s", bodyBytes: 100_000, networkSeconds: 1, config: c)
         }
-        XCTAssertEqual(SyncBatchLimit.current(host: "s", config: c), 4_000_000, "the limit was not what held requests back")
+        XCTAssertEqual(SyncBatchLimit.current(host: "s", config: c), 500_000, "the limit was not what held requests back")
         fullSuccesses(20, host: "s", config: c, seconds: SyncBatchLimit.growMaxNetworkSeconds + 1)
-        XCTAssertEqual(SyncBatchLimit.current(host: "s", config: c), 4_000_000, "slow network")
+        XCTAssertEqual(SyncBatchLimit.current(host: "s", config: c), 500_000, "slow network")
         // The AWARE server (Flask) grows like AWARE Micro
         let legacy = DbSyncConfig(); legacy.serverType = .aware
         fullSuccesses(SyncBatchLimit.growAfterFullSuccesses, host: "l", config: legacy)
-        XCTAssertEqual(SyncBatchLimit.current(host: "l", config: legacy), 6_000_000)
+        XCTAssertEqual(SyncBatchLimit.current(host: "l", config: legacy), 750_000)
         legacy.maxBatchBytesCeiling = legacy.maxBatchBytes ?? SyncBatchLimit.defaultBytes
-        XCTAssertEqual(SyncBatchLimit.current(host: "l", config: legacy), 4_000_000,
+        XCTAssertEqual(SyncBatchLimit.current(host: "l", config: legacy), 500_000,
                        "a ceiling equal to the size turns growth off")
     }
 
     func testLimitLearnedFrom413GrowsBackBelowTheRejectedSize() {
         let c = DbSyncConfig(); c.serverType = .aware_micro
-        SyncBatchLimit.recordTooLarge(host: "r", bodyBytes: 3_000_000)
-        XCTAssertEqual(SyncBatchLimit.current(host: "r", config: c), 1_500_000)
+        // A server that accepts a little more than the default: growth finds it, a 413 marks the edge
+        SyncBatchLimit.recordTooLarge(host: "r", bodyBytes: 700_000)
+        XCTAssertEqual(SyncBatchLimit.current(host: "r", config: c), 350_000)
         fullSuccesses(SyncBatchLimit.growAfterFullSuccesses * 10, host: "r", config: c)
-        XCTAssertEqual(SyncBatchLimit.current(host: "r", config: c), 2_700_000, "90 % of the rejected size")
+        XCTAssertEqual(SyncBatchLimit.current(host: "r", config: c), 630_000, "90 % of the rejected size")
+    }
+
+    func testStateShowsWhatWasLearnedAndResetForgetsIt() {
+        let c = DbSyncConfig(); c.serverType = .aware
+        var st = SyncBatchLimit.state(host: "https://s.example.com", config: c)
+        XCTAssertEqual(st.host, "s.example.com")
+        XCTAssertEqual(st.currentBytes, 500_000)
+        XCTAssertFalse(st.hasLearned)
+        SyncBatchLimit.recordTooLarge(host: "s.example.com", bodyBytes: 516_873)
+        fullSuccesses(SyncBatchLimit.growAfterFullSuccesses * 5, host: "s.example.com", config: c)
+        st = SyncBatchLimit.state(host: "https://s.example.com", config: c)
+        XCTAssertEqual(st.rejectedBytes, 516_873)
+        XCTAssertEqual(st.currentBytes, 465_185, "90 % of the rejected size")
+        XCTAssertTrue(st.hasLearned)
+        XCTAssertTrue(SyncBatchLimit.learnedHosts().contains("s.example.com"))
+        SyncBatchLimit.reset(host: " https://s.example.com ")
+        st = SyncBatchLimit.state(host: "s.example.com", config: c)
+        XCTAssertFalse(st.hasLearned)
+        XCTAssertEqual(st.currentBytes, 500_000)
     }
 
     // MARK: - Prefetch and diagnostics
@@ -252,11 +266,17 @@ final class DbSyncBatchingTests: XCTestCase {
         engine.mockData = rows(3000)
         config.maxBatchBytes = 50_000
         config.prefetchNextBatch = true
+        var handled: [SyncBatchMetrics] = []
+        let lock = NSLock()
+        config.batchHandler = { m in lock.lock(); handled.append(m); lock.unlock() }
         let (bodies, _) = sync(server: .aware_micro)
         let ids = bodies.flatMap(jsonRows).compactMap { ($0["id"] as? NSNumber)?.int64Value }
         XCTAssertEqual(ids, (1...3000).map(Int64.init), "every row once, in order")
 
         let batches = SyncDiagnostics.shared.recentBatches(table: table)
+        XCTAssertEqual(handled.count, bodies.count, "batchHandler is called for each request")
+        XCTAssertEqual(handled.map(\.rows).reduce(0, +), 3000)
+        XCTAssertEqual(handled.map(\.bodyBytes).reduce(0, +), bodies.map(\.count).reduce(0, +))
         XCTAssertEqual(batches.count, bodies.count)
         XCTAssertTrue(batches.dropFirst().allSatisfy(\.prefetched), "requests after the first were prepared in advance")
         XCTAssertEqual(batches.map(\.rows).reduce(0, +), 3000)

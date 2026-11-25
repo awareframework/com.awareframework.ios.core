@@ -111,11 +111,12 @@ enum SyncPacing {
 
 /// The largest request body a sync sends to a host.
 ///
-/// - Default: `DbSyncConfig.maxBatchBytes`, or 4 MB when it is not set, for every server type
+/// - Default: `DbSyncConfig.maxBatchBytes`, or 500 KB when it is not set, for every server type
 ///   (AWARE Micro, and the AWARE server, whose PHP version is retired and whose endpoints are served
-///   by Flask; Google App Engine accepts up to 32 MB). The margin keeps uploads short on slow
-///   networks and keeps memory use low. A server with a smaller limit (for example nginx, 1 MB by
-///   default) answers 413, and the limit is lowered and remembered (below).
+///   by Flask). 500 KB is Flask's default limit of a form field (Werkzeug 3.1 `MAX_FORM_MEMORY_SIZE`),
+///   and the AWARE server receives all rows of a request in one form field, so a server with default
+///   settings never rejects the first requests. A server with a higher limit gets larger requests
+///   by growth (below). A server with a smaller limit (413) gets a smaller size, which is remembered.
 /// - Growth (like `AWAREFetchSizeAdjuster` of AWAREFramework-iOS 1.x): after `growAfterFullSuccesses`
 ///   requests in a row that were filled up to the limit and finished within `growMaxNetworkSeconds`,
 ///   the limit grows by half, up to the ceiling (`DbSyncConfig.maxBatchBytesCeiling`; 8 MB by
@@ -127,8 +128,9 @@ enum SyncPacing {
 ///   changes), and grows back after `growAfterSuccesses` successful requests.
 public enum SyncBatchLimit {
 
-    /// Default request size, for every server type
-    public static let defaultBytes = 4_000_000
+    /// Default request size, for every server type: Flask's default form field limit
+    /// (Werkzeug 3.1 `MAX_FORM_MEMORY_SIZE` = 500,000 bytes)
+    public static let defaultBytes = 500_000
     /// Default ceiling of the growth, for every server type (Google App Engine accepts 32 MB). Kept
     /// well below it: each table holds the body in flight and the prefetched next one, and several
     /// tables upload at the same time, so larger bodies risk the app's memory limit.
@@ -279,13 +281,75 @@ public enum SyncBatchLimit {
         }
     }
 
+    /// The key a sync uses for `host` (a server URL or host name): the host without `http://` or `https://`.
+    public static func hostKey(_ host: String) -> String {
+        AwareUtils.cleanHostName(host.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    /// What is known about the request size for a host, for display.
+    public struct State: Equatable {
+        public let host: String
+        /// The configured or default size (`DbSyncConfig.maxBatchBytes`)
+        public let configuredBytes: Int
+        /// The largest size growth may reach (`DbSyncConfig.maxBatchBytesCeiling`)
+        public let ceilingBytes: Int
+        /// The size the next request uses
+        public let currentBytes: Int
+        /// Size reached by growth (saved), if above the configured size
+        public let grownBytes: Int?
+        /// Limit learned from a 413 (saved)
+        public let tooLargeLimitBytes: Int?
+        /// Smallest body the host rejected with 413 (saved); growth stays below 90 % of it
+        public let rejectedBytes: Int?
+        /// Limit after a timeout (this run of the app only)
+        public let timeoutLimitBytes: Int?
+
+        /// Whether anything learned is in effect
+        public var hasLearned: Bool {
+            grownBytes != nil || tooLargeLimitBytes != nil || rejectedBytes != nil || timeoutLimitBytes != nil
+        }
+    }
+
+    /// What is known about `host` (a server URL or host name) under `config`.
+    public static func state(host: String, config: DbSyncConfig) -> State {
+        let key = hostKey(host)
+        lock.lock()
+        defer { lock.unlock() }
+        let defaults = UserDefaults.standard
+        func saved(_ prefix: String) -> Int? {
+            let v = defaults.integer(forKey: prefix + key)
+            return v > 0 ? v : nil
+        }
+        let grown = saved(grownKeyPrefix).flatMap { $0 > configured(config) ? $0 : nil }
+        return State(
+            host: key, configuredBytes: configured(config), ceilingBytes: ceiling(config),
+            currentBytes: currentLocked(host: key, config: config), grownBytes: grown,
+            tooLargeLimitBytes: saved(keyPrefix), rejectedBytes: saved(rejectedKeyPrefix),
+            timeoutLimitBytes: timeoutLimits[key])
+    }
+
+    /// Hosts with saved learned values.
+    public static func learnedHosts() -> [String] {
+        let prefixes = [keyPrefix, grownKeyPrefix, rejectedKeyPrefix]
+        var hosts = Set<String>()
+        for key in UserDefaults.standard.dictionaryRepresentation().keys {
+            if let prefix = prefixes.first(where: { key.hasPrefix($0) }) {
+                hosts.insert(String(key.dropFirst(prefix.count)))
+            }
+        }
+        lock.lock()
+        hosts.formUnion(timeoutLimits.keys)
+        lock.unlock()
+        return hosts.sorted()
+    }
+
     /// Forget what was learned about `host` (or every host).
     public static func reset(host: String? = nil) {
         lock.lock()
         defer { lock.unlock() }
         let defaults = UserDefaults.standard
         let prefixes = [keyPrefix, grownKeyPrefix, rejectedKeyPrefix]
-        if let host {
+        if let host = host.map(hostKey) {
             prefixes.forEach { defaults.removeObject(forKey: $0 + host) }
             timeoutLimits[host] = nil
             successes[host] = nil

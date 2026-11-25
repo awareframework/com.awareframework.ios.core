@@ -12,6 +12,107 @@
 //
 
 import Foundation
+#if canImport(Darwin)
+    import Darwin
+#endif
+
+// MARK: - Clocks
+
+/// Wall and CPU clocks for the measurements.
+enum SyncClock {
+    /// Monotonic time in nanoseconds
+    @inline(__always) static func now() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
+
+    /// CPU time of the current thread in nanoseconds
+    static func threadCPU() -> UInt64 {
+        #if canImport(Darwin)
+            return clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID)
+        #else
+            return 0
+        #endif
+    }
+
+    static func seconds(_ nanos: UInt64) -> TimeInterval { Double(nanos) / 1_000_000_000 }
+
+    /// Seconds since `start` (nanoseconds from `now()`)
+    static func since(_ start: UInt64) -> TimeInterval { seconds(now() &- start) }
+
+    /// CPU time of the whole app (every thread), user and system
+    static func processCPU() -> TimeInterval {
+        var usage = rusage()
+        getrusage(RUSAGE_SELF, &usage)
+        func s(_ t: timeval) -> TimeInterval { TimeInterval(t.tv_sec) + TimeInterval(t.tv_usec) / 1_000_000 }
+        return s(usage.ru_utime) + s(usage.ru_stime)
+    }
+
+    /// Memory the app uses (what iOS counts toward its memory limit), in bytes
+    static func footprint() -> UInt64? {
+        #if canImport(Darwin)
+            var info = task_vm_info_data_t()
+            var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
+            let result = withUnsafeMutablePointer(to: &info) {
+                $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                    task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+                }
+            }
+            return result == KERN_SUCCESS ? info.phys_footprint : nil
+        #else
+            return nil
+        #endif
+    }
+}
+
+// MARK: - Phases
+
+/// Where the device spent the time of a request, phase by phase.
+public struct SyncPhaseTimes: Equatable {
+    /// Waiting for the database queue (the sensors' writes use it too)
+    public var dbWait: TimeInterval = 0
+    /// Stepping through the rows in SQLite
+    public var dbRead: TimeInterval = 0
+    /// Writing the rows as JSON
+    public var jsonEncode: TimeInterval = 0
+    /// Measuring whether rows fit in the size limit (URL encoding for the legacy AWARE server)
+    public var sizeCheck: TimeInterval = 0
+    /// Joining the rows into the request body
+    public var assemble: TimeInterval = 0
+    /// Turning the body into bytes for the request
+    public var toData: TimeInterval = 0
+    /// Deleting uploaded rows
+    public var delete: TimeInterval = 0
+    /// CPU time of the preparation (reading to bytes)
+    public var prepareCPU: TimeInterval = 0
+
+    public init() {}
+
+    /// Reading the rows to the bytes of the request
+    public var prepare: TimeInterval { dbWait + dbRead + jsonEncode + sizeCheck + assemble + toData }
+
+    /// The phases with their names, in order
+    public var named: [(String, TimeInterval)] {
+        [("db wait", dbWait), ("db read", dbRead), ("json", jsonEncode), ("size check", sizeCheck),
+         ("assemble", assemble), ("to bytes", toData), ("delete", delete)]
+    }
+
+    public static func + (a: SyncPhaseTimes, b: SyncPhaseTimes) -> SyncPhaseTimes {
+        var r = SyncPhaseTimes()
+        r.dbWait = a.dbWait + b.dbWait
+        r.dbRead = a.dbRead + b.dbRead
+        r.jsonEncode = a.jsonEncode + b.jsonEncode
+        r.sizeCheck = a.sizeCheck + b.sizeCheck
+        r.assemble = a.assemble + b.assemble
+        r.toData = a.toData + b.toData
+        r.delete = a.delete + b.delete
+        r.prepareCPU = a.prepareCPU + b.prepareCPU
+        return r
+    }
+
+    /// Text like "db read 40 ms, json 25 ms, ... (CPU 60 ms)"
+    public var description: String {
+        named.filter { $0.1 >= 0.0005 }.map { "\($0.0) \(SyncDiagnostics.seconds($0.1))" }.joined(separator: ", ")
+            + " (CPU \(SyncDiagnostics.seconds(prepareCPU)))"
+    }
+}
 
 /// One request of a sync.
 public struct SyncBatchMetrics: CustomStringConvertible {
@@ -43,6 +144,11 @@ public struct SyncBatchMetrics: CustomStringConvertible {
     public let background: Bool
     public let lowPower: Bool
     public let thermalState: ProcessInfo.ThermalState
+    /// Phase by phase times of the preparation and the deletion on the device
+    public var phases = SyncPhaseTimes()
+    /// CPU use of the whole app since the previous request (100 = one core), and its memory
+    public var appCPUPercent: Double?
+    public var memoryMB: Double?
 
     /// Body bytes per second while the body was sent
     public var uploadBytesPerSecond: Double? {
@@ -66,7 +172,11 @@ public struct SyncBatchMetrics: CustomStringConvertible {
         if background { parts.append("background") }
         if lowPower { parts.append("low power") }
         if thermalState == .serious || thermalState == .critical { parts.append("hot") }
-        return parts.joined(separator: ", ")
+        var text = parts.joined(separator: ", ")
+        text += " | phases: " + phases.description
+        if let cpu = appCPUPercent { text += String(format: " | app CPU %.0f%%", cpu) }
+        if let mb = memoryMB { text += String(format: ", memory %.0f MB", mb) }
+        return text
     }
 }
 
@@ -106,6 +216,10 @@ public struct SyncRunSummary: CustomStringConvertible {
     public let retryWaitSeconds: TimeInterval
     public let lastLimitBytes: Int
     public let backgroundBatches: Int
+    /// Phase by phase times of every request together
+    public var phases = SyncPhaseTimes()
+    /// Largest memory use of the app during the sync
+    public var peakMemoryMB: Double?
 
     public var elapsedSeconds: TimeInterval { max(0, endedAt.timeIntervalSince(startedAt)) }
     public var rowsPerSecond: Double { elapsedSeconds > 0 ? Double(rows) / elapsedSeconds : 0 }
@@ -150,6 +264,9 @@ public struct SyncRunSummary: CustomStringConvertible {
             + " | \(shares)"
             + (overlappedPrepareSeconds > 0 ? " | overlapped prepare \(SyncDiagnostics.seconds(overlappedPrepareSeconds))" : "")
             + " | bottleneck: \(bottleneck.rawValue)"
+            + " | device phases: " + phases.description
+            + (rows > 0 ? String(format: " | %.0f ms per 1000 rows prepared", phases.prepare / Double(rows) * 1_000_000) : "")
+            + (peakMemoryMB.map { String(format: " | peak memory %.0f MB", $0) } ?? "")
     }
 }
 
@@ -189,6 +306,8 @@ struct SyncRunRecorder {
     var retryWait: TimeInterval = 0
     var lastLimit = 0
     var backgroundBatches = 0
+    var phases = SyncPhaseTimes()
+    var peakMemoryMB: Double?
 
     init(table: String, host: String) {
         self.table = table
@@ -212,17 +331,22 @@ struct SyncRunRecorder {
         if isRetryWait { retryWait += m.restSeconds } else { rest += m.restSeconds }
         lastLimit = m.limitBytes
         if m.background { backgroundBatches += 1 }
+        phases = phases + m.phases
+        if let mb = m.memoryMB { peakMemoryMB = max(peakMemoryMB ?? 0, mb) }
     }
 
     func summary(success: Bool, endedAt: Date = Date()) -> SyncRunSummary? {
         guard let startedAt, batches + failedRequests > 0 else { return nil }
-        return SyncRunSummary(
+        var summary = SyncRunSummary(
             table: table, host: host, startedAt: startedAt, endedAt: endedAt, success: success,
             batches: batches, failedRequests: failedRequests, rows: rows, bytes: bytes,
             prepareSeconds: prepare, overlappedPrepareSeconds: overlappedPrepare, networkSeconds: network,
             connectSeconds: connect, uploadSeconds: upload, serverSeconds: server, deleteSeconds: delete,
             restSeconds: rest, retryWaitSeconds: retryWait, lastLimitBytes: lastLimit,
             backgroundBatches: backgroundBatches)
+        summary.phases = phases
+        summary.peakMemoryMB = peakMemoryMB
+        return summary
     }
 }
 
@@ -237,10 +361,26 @@ public final class SyncDiagnostics {
     public var printsToConsole = false
 
     private let lock = NSLock()
+    private var loadSample: (time: UInt64, cpu: TimeInterval)?
     private var batches: [SyncBatchMetrics] = []
     private var summaries: [String: SyncRunSummary] = [:]
 
     private init() {}
+
+    /// CPU use of the whole app since the last call (100 = one core), and its memory in MB
+    func sampleLoad() -> (cpuPercent: Double?, memoryMB: Double?) {
+        let now = SyncClock.now()
+        let cpu = SyncClock.processCPU()
+        lock.lock()
+        let previous = loadSample
+        loadSample = (now, cpu)
+        lock.unlock()
+        var percent: Double?
+        if let previous, now > previous.time {
+            percent = (cpu - previous.cpu) / SyncClock.seconds(now - previous.time) * 100
+        }
+        return (percent, SyncClock.footprint().map { Double($0) / 1_000_000 })
+    }
 
     func record(_ batch: SyncBatchMetrics) {
         lock.lock()

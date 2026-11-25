@@ -349,9 +349,9 @@ class UnitTests: XCTestCase {
         original.debugLevel = .trace
         original.completionHandler = { _, _ in }
         original.progressHandler = { _, _ in }
+        original.batchHandler = { _ in }
         original.dispatchQueue = DispatchQueue(label: "copy.test")
         original.backgroundSession = true
-        original.compactDataFormat = !DbSyncConfig.defaultCompactDataFormat
         original.serverType = DbSyncConfig.defaultServerType == .aware_micro ? .aware_light : .aware_micro
         original.studyNumber = DbSyncConfig.defaultStudyNumber + 1
         original.studyKey = DbSyncConfig.defaultStudyKey + "-key"
@@ -532,7 +532,6 @@ class UnitTests: XCTestCase {
             setting.removeAfterSync = true
             setting.debug = true
             setting.test = true
-            setting.compactDataFormat = false
             setting.dispatchQueue = DispatchQueue(label: "com.awareframework.ios.sensor.core.syncTask")
         }
         let helper = DbSyncHelper.init(engine: sensor.dbEngine!,

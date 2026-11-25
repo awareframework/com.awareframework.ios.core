@@ -1,5 +1,6 @@
 import Foundation
 import GRDB
+import GRDBSQLite
 
 private final class SQLiteSyncStopNotificationObserver: NSObject, @unchecked Sendable {
     static let shared = SQLiteSyncStopNotificationObserver()
@@ -192,10 +193,12 @@ open class SQLiteEngine: Engine {
 
     open override func save(_ data: [any BaseDbModelSQLite], completion: ((Error?) -> Void)?) {
         do {
-            guard let queue = getSQLiteInstance() else {
-                completion?(nil)
-                return
+            guard let url = sqliteFileURL else {
+                throw CocoaError(.fileNoSuchFile, userInfo: [
+                    NSLocalizedDescriptionKey: "SQLite database path is not configured."
+                ])
             }
+            let queue = try Self.databaseQueue(for: url.path)
             try Self.retryLockedDatabaseWork {
                 try queue.write { db in
                     try db.execute(sql: "PRAGMA busy_timeout = 10000")
@@ -266,59 +269,145 @@ open class SQLiteEngine: Engine {
     /// Upload rows written as JSON straight from the SQLite values, without a dictionary per row.
     /// See `Engine.fetchUploadJSON(afterId:limit:omitting:)`.
     public override func fetchUploadJSON(afterId: Int64, limit: Int, omitting: Set<String>) -> [UploadRowJSON]? {
+        var buffer: [UInt8] = []
+        guard let spans = appendUploadJSON(afterId: afterId, limit: limit, omitting: omitting, to: &buffer) else {
+            return nil
+        }
+        return spans.map { span in
+            UploadRowJSON(id: span.id, json: span.range.map { String(decoding: buffer[$0], as: UTF8.self) })
+        }
+    }
+
+    /// See `Engine.appendUploadJSON(afterId:limit:omitting:to:)`. The values are read with the SQLite
+    /// C API and written as JSON bytes: the column keys are made once per query, numbers are written
+    /// without making strings, and a text column that repeats the previous row's value (device ID,
+    /// OS, time zone...) reuses its JSON.
+    public override func appendUploadJSON(afterId: Int64, limit: Int, omitting: Set<String>,
+                                          to out: inout [UInt8]) -> [UploadRowSpan]? {
         guard let tableName = config.tableName,
             let db = getSQLiteInstance()
         else { return nil }
         let sql = "SELECT * FROM \(tableName) WHERE id > ? ORDER BY rowid LIMIT ?"
+        var timing = UploadJSONTiming()
+        let called = SyncClock.now()
+        defer { lastUploadJSONTiming = timing }
+        let rollback = out.count
         do {
             return try Self.retryLockedDatabaseWork {
-                try db.read { db -> [UploadRowJSON]? in
-                    let cursor = try Row.fetchCursor(db, sql: sql, arguments: [afterId, max(0, limit)])
-                    var results: [UploadRowJSON] = []
-                    results.reserveCapacity(max(0, limit))
-                    var json = ""
-                    while let row = try cursor.next() {
-                        var id: Int64?
-                        var valid = true
-                        json.removeAll(keepingCapacity: true)
-                        json.append("{")
-                        var first = true
-                        for (column, value) in row {
-                            if column == "id", case .int64(let v) = value.storage { id = v }
-                            if omitting.contains(column) { continue }
-                            switch value.storage {
-                            case .null:
-                                continue  // fetch(filter:limit:) leaves NULL columns out of the row
-                            case .blob:
-                                valid = false
-                            case .int64(let v):
-                                if !first { json.append(",") }
-                                UploadJSONWriter.appendKey(column, to: &json)
-                                json.append(String(v))
-                            case .double(let v):
-                                if !first { json.append(",") }
-                                UploadJSONWriter.appendKey(column, to: &json)
-                                valid = UploadJSONWriter.appendDouble(v, to: &json) && valid
-                            case .string(let v):
-                                if !first { json.append(",") }
-                                UploadJSONWriter.appendKey(column, to: &json)
-                                UploadJSONWriter.appendString(v, to: &json)
-                            }
-                            first = false
-                            if !valid { break }
+                out.removeSubrange(rollback...)  // a retried attempt starts again
+                return try db.read { db -> [UploadRowSpan]? in
+                    let entered = SyncClock.now()
+                    let cpuStart = SyncClock.threadCPU()
+                    timing.queueWait = SyncClock.seconds(entered &- called)
+                    var readNanos: UInt64 = 0
+                    var encodeNanos: UInt64 = 0
+                    defer {
+                        timing.read = SyncClock.seconds(readNanos)
+                        timing.encode = SyncClock.seconds(encodeNanos)
+                        timing.cpu = SyncClock.seconds(SyncClock.threadCPU() &- cpuStart)
+                    }
+                    var t = SyncClock.now()
+                    let statement = try db.makeStatement(sql: sql)
+                    let stmt = statement.sqliteStatement
+                    let columnCount = Int(sqlite3_column_count(stmt))
+                    var keys: [[UInt8]] = []
+                    var included: [Bool] = []
+                    var idColumn: Int32?
+                    for i in 0..<columnCount {
+                        let name = sqlite3_column_name(stmt, Int32(i)).map { String(cString: $0) } ?? ""
+                        keys.append(JSONBytes.key(name))
+                        included.append(!omitting.contains(name))
+                        if name == "id" { idColumn = Int32(i) }
+                    }
+                    // The previous row's text value and its JSON, per column. A column whose value
+                    // changes twice in a row stops being cached.
+                    var lastText = [[UInt8]](repeating: [], count: columnCount)
+                    var lastJSON = [[UInt8]](repeating: [], count: columnCount)
+                    var cacheMisses = [Int](repeating: 0, count: columnCount)
+                    var spans: [UploadRowSpan] = []
+                    spans.reserveCapacity(max(0, limit))
+                    let cursor = try Row.fetchCursor(statement, arguments: [afterId, max(0, limit)])
+                    while try cursor.next() != nil {
+                        let stepped = SyncClock.now()
+                        readNanos += stepped &- t
+                        defer {
+                            t = SyncClock.now()
+                            encodeNanos += t &- stepped
                         }
                         // Rows without an integer id cannot be tracked by the sync marker
-                        guard let rowId = id else { return nil }
-                        json.append("}")
-                        results.append(UploadRowJSON(id: rowId, json: valid ? String(json) : nil))
-                        if !valid { break }
+                        guard let idColumn, sqlite3_column_type(stmt, idColumn) == SQLITE_INTEGER else { return nil }
+                        let rowId = sqlite3_column_int64(stmt, idColumn)
+                        let start = out.count
+                        var valid = true
+                        var first = true
+                        out.append(UInt8(ascii: "{"))
+                        for i in 0..<columnCount where included[i] {
+                            let column = Int32(i)
+                            let type = sqlite3_column_type(stmt, column)
+                            if type == SQLITE_NULL { continue }  // fetch(filter:limit:) leaves NULL columns out
+                            if type == SQLITE_BLOB {
+                                valid = false
+                                break
+                            }
+                            if !first { out.append(UInt8(ascii: ",")) }
+                            first = false
+                            out.append(contentsOf: keys[i])
+                            switch type {
+                            case SQLITE_INTEGER:
+                                JSONBytes.appendInt(sqlite3_column_int64(stmt, column), to: &out)
+                            case SQLITE_FLOAT:
+                                valid = JSONBytes.appendDouble(sqlite3_column_double(stmt, column), to: &out)
+                            default:
+                                Self.appendText(stmt, column: column, cacheIndex: i, to: &out, lastText: &lastText,
+                                                lastJSON: &lastJSON, cacheMisses: &cacheMisses)
+                            }
+                            if !valid { break }
+                        }
+                        if valid {
+                            out.append(UInt8(ascii: "}"))
+                            spans.append(UploadRowSpan(id: rowId, range: start..<out.count))
+                        } else {
+                            out.removeSubrange(start...)
+                            spans.append(UploadRowSpan(id: rowId, range: nil))
+                            break
+                        }
                     }
-                    return results
+                    return spans
                 }
             }
         } catch {
-            print("[Error][SQLiteEngine] fetchUploadJSON failed: \(error)")
+            print("[Error][SQLiteEngine] appendUploadJSON failed: \(error)")
             return nil
+        }
+    }
+
+    /// A TEXT value as a JSON string. Like GRDB, the text ends at its first NUL byte, and invalid
+    /// UTF-8 is repaired (U+FFFD).
+    private static func appendText(_ stmt: SQLiteStatement, column: Int32, cacheIndex i: Int, to out: inout [UInt8],
+                                   lastText: inout [[UInt8]], lastJSON: inout [[UInt8]], cacheMisses: inout [Int]) {
+        let count = Int(sqlite3_column_bytes(stmt, column))
+        guard let pointer = sqlite3_column_text(stmt, column) else {
+            out.append(contentsOf: [UInt8(ascii: "\""), UInt8(ascii: "\"")])
+            return
+        }
+        var bytes = UnsafeBufferPointer(start: pointer, count: count)
+        if let nul = bytes.firstIndex(of: 0) { bytes = UnsafeBufferPointer(rebasing: bytes[0..<nul]) }
+        let caching = cacheMisses[i] < 2
+        if caching, bytes.elementsEqual(lastText[i]), lastJSON[i].isEmpty == false {
+            out.append(contentsOf: lastJSON[i])
+            cacheMisses[i] = 0
+            return
+        }
+        let start = out.count
+        if bytes.contains(where: { $0 >= 0x80 }) {
+            JSONBytes.appendString(String(decoding: bytes, as: UTF8.self), to: &out)
+        } else {
+            JSONBytes.appendString(utf8: bytes, to: &out)
+        }
+        if caching {
+            cacheMisses[i] += lastJSON[i].isEmpty ? 0 : 1
+            lastText[i] = Array(bytes)
+            lastJSON[i] = Array(out[start...])
         }
     }
 
@@ -426,6 +515,26 @@ open class SQLiteEngine: Engine {
     }
 
     // MARK: - Sync
+
+    /// The bodies of the next `batches` upload requests of this table, without sending anything or
+    /// changing anything (see `DbSyncHelper.previewRequests(batches:)`). For checks.
+    public func previewUploadRequests(config syncConfig: DbSyncConfig, batches: Int,
+                                      host: String = "benchmark.invalid") -> [DbSyncHelper.PreviewRequest] {
+        guard let tableName = config.tableName else { return [] }
+        let helper = DbSyncHelper(engine: self, host: host, tableName: tableName, config: syncConfig)
+        return helper.previewRequests(batches: batches)
+    }
+
+    /// Measure how long preparing upload requests of this table takes on this device, without
+    /// sending anything or changing anything (see `DbSyncHelper.benchmarkPreparation(batches:)`).
+    /// `host` only names the size limit to use: the default host has nothing learned, so the
+    /// requests have the size of `config.maxBatchBytes` (or the default).
+    public func benchmarkUploadPreparation(config syncConfig: DbSyncConfig, batches: Int,
+                                           host: String = "benchmark.invalid") -> [SyncBatchMetrics] {
+        guard let tableName = config.tableName else { return [] }
+        let helper = DbSyncHelper(engine: self, host: host, tableName: tableName, config: syncConfig)
+        return helper.benchmarkPreparation(batches: batches)
+    }
 
     /// The upload of one table of one database. Shared by every engine of that table, so that two
     /// syncs of the same rows never run at the same time.
