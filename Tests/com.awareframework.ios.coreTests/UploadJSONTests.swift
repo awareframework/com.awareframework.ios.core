@@ -108,6 +108,43 @@ final class UploadJSONTests: XCTestCase {
     }
 
     /// A sync over SQLite with the fast path sends every row once, the same values as the rows hold
+    /// Sizes are measured 100 rows at a time on the fast path: requests still fill the limit and
+    /// carry every row once, for JSON and for the URL-encoded form of the legacy AWARE server
+    func testGroupedSizeCheckFillsTheLimit() throws {
+        for server in [ServerType.aware_micro, .aware] {
+            path = "upload_json_\(UUID().uuidString)"
+            let engine = try makeEngine(rows: (1...3000).map { i in
+                [1_795_060_031_991 + i * 10, "dev", "it's \"x\" \(i)", 0.0123456789 * Double(i % 97), -0.98765432, nil]
+            })
+            let config = DbSyncConfig()
+            config.serverType = server
+            config.maxBatchBytes = 40_000
+            let metrics = engine.benchmarkUploadPreparation(config: config, batches: 1000)
+            XCTAssertEqual(metrics.map(\.rows).reduce(0, +), 3000, "\(server): every row")
+            for (i, m) in metrics.enumerated() {
+                XCTAssertLessThanOrEqual(m.bodyBytes, 40_000, "\(server) request \(i)")
+                if i < metrics.count - 1 {
+                    XCTAssertGreaterThan(m.bodyBytes, 38_000, "\(server) request \(i) should be close to the limit")
+                }
+            }
+            XCTAssertGreaterThan(metrics[0].phases.dbRead + metrics[0].phases.jsonEncode, 0)
+        }
+    }
+
+    /// The benchmark sends nothing and changes nothing
+    func testBenchmarkChangesNothing() throws {
+        let engine = try makeEngine(rows: (1...500).map { i in [1_795_060_031_991 + i, "dev", "", 0.1, 0.2, nil] })
+        let config = DbSyncConfig()
+        config.maxBatchBytes = 10_000
+        let key = DbSyncUtils.markerKey(for: table, database: engine.databaseIdentifier,
+                                        maxAssignedId: engine.maxAssignedId(tableName: table))
+        let before = DbSyncUtils.getLastUploadedId(forKey: key)
+        let metrics = engine.benchmarkUploadPreparation(config: config, batches: 3)
+        XCTAssertEqual(metrics.count, 3)
+        XCTAssertEqual(DbSyncUtils.getLastUploadedId(forKey: key), before, "marker unchanged")
+        XCTAssertEqual(engine.count(filter: nil), 500, "rows unchanged")
+    }
+
     func testSyncSendsEveryRowOnce() throws {
         let engine = try makeEngine(rows: (1...3000).map { i in
             [1_795_060_031_991 + i * 10, "dev", "", 0.0123456789 * Double(i % 97), -0.98765432, nil]

@@ -597,25 +597,6 @@ class DbSyncHelperTests: XCTestCase {
 
         wait(for: [expectation], timeout: 5.0)
     }
-
-    // MARK: - Compact Data Format Tests
-
-    func testCompactDataFormat() {
-        let expectation = XCTestExpectation(description: "Compact data format")
-
-        mockConfig.compactDataFormat = true
-        mockEngine.mockData = [
-            ["id": Int64(1), "data": "test1", "os": "iOS", "deviceId": "device1"],
-            ["id": Int64(2), "data": "test2", "os": "iOS", "deviceId": "device1"]
-        ]
-
-        syncHelper.run { success, error in
-            XCTAssertTrue(success)
-            expectation.fulfill()
-        }
-
-        wait(for: [expectation], timeout: 5.0)
-    }
 }
 
 // MARK: - DbSyncUtils Tests

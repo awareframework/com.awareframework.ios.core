@@ -80,6 +80,8 @@ open class SensorConfig{
                 self.serverType = .aware_micro
             } else if serverType == 4 {
                 self.serverType = .aware_light
+            } else if serverType == 5 {
+                self.serverType = .aware_hub
             }
         }
 

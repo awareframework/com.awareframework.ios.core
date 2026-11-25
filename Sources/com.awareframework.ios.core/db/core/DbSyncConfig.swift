@@ -10,10 +10,14 @@
 ///   - batchSize: Rows read from the database at a time while a request is built. Default is `1000`.
 ///     (Up to 1.6, it was the number of rows per request. A request now holds as many rows as fit
 ///     in `maxBatchBytes`, up to `maxBatchRows`.)
-///   - maxBatchBytes: Largest request body in bytes. `nil` (default) chooses by server type: 4 MB for
-///     AWARE Micro (Google App Engine accepts 32 MB), 900 KB for other servers (below the nginx default
-///     of 1 MB). A host that answers 413 gets a smaller limit, which is remembered. See `SyncBatchLimit`.
+///   - maxBatchBytes: Largest request body in bytes. `nil` (default) is 500 KB (Flask's default form limit) for every server type
+///     (up to 1.7: 900 KB for servers other than AWARE Micro). A host that answers 413 gets a smaller
+///     limit, which is remembered. See `SyncBatchLimit`.
+///   - maxBatchBytesCeiling: Largest size `maxBatchBytes` may grow to after requests in a row that were
+///     full and fast (see `SyncBatchLimit`). `nil` (default): 8 MB for every server type.
 ///   - maxBatchRows: Largest number of rows per request. Default is `20000`.
+///   - prefetchNextBatch: Choose and build the next request while the current one is in flight, so the
+///     server and the device work at the same time. Default is `true`.
 ///   - batchInterval: Shortest rest between requests, in seconds. Default is `0`. (1.6 waited 0.1 s.)
 ///   - cpuRestRatio: Rest between requests, as a multiple of the CPU time the last request took to
 ///     prepare, while the app is in the foreground. Default is `1` (the sync uses at most about half
@@ -26,9 +30,10 @@
 ///   - debug: A boolean indicating whether to enable debug mode. Default is `false`.
 ///   - completionHandler: An optional completion handler to be called after synchronization.
 ///   - progressHandler: An optional progress handler to be called during synchronization.
+///   - batchHandler: Called after each request with its `SyncBatchMetrics` (rows, bytes, times), on the
+///     sync queue. Sensors that upload several tables pass it to every table, like `progressHandler`.
 ///   - dispatchQueue: An optional dispatch queue for synchronization tasks.
 ///   - backgroundSession: A boolean indicating whether to use a background session for synchronization. Default is `false`.
-///   - compactDataFormat: A boolean indicating whether to use a compact data format for synchronization. Default is `true`.
 ///
 /// - Methods:
 ///   - init(): Initializes a new instance of `DbSyncConfig` with default values.
@@ -77,7 +82,19 @@ public class DbSyncConfig {
     public static var defaultServerType: ServerType = .aware_micro
     public static var defaultStudyNumber: Int = 1
     public static var defaultStudyKey: String = ""
-    public static var defaultCompactDataFormat: Bool = false
+    /// The compact data format was removed: rows are always uploaded one object per row.
+    @available(*, deprecated, message: "The compact data format was removed; this setting has no effect.")
+    public static var defaultCompactDataFormat: Bool {
+        get { false }
+        set { }
+    }
+    /// App-wide defaults for new configs (sensors create their configs themselves)
+    public static var defaultMaxBatchBytes: Int? = nil
+    public static var defaultMaxBatchBytesCeiling: Int? = nil
+    public static var defaultMaxBatchRows: Int = 20000
+    public static var defaultCpuRestRatio: Double = 1
+    public static var defaultBackgroundCpuRestRatio: Double = 3
+    public static var defaultPrefetchNextBatch: Bool = true
 
     public var removeAfterSync: Bool = true
 
@@ -120,11 +137,13 @@ public class DbSyncConfig {
         set { if let period = newValue { keepDataAfterSync = period.seconds } }
     }
     public var batchSize: Int = 1000
-    public var maxBatchBytes: Int? = nil
-    public var maxBatchRows: Int = 20000
+    public var maxBatchBytes: Int? = DbSyncConfig.defaultMaxBatchBytes
+    public var maxBatchBytesCeiling: Int? = DbSyncConfig.defaultMaxBatchBytesCeiling
+    public var maxBatchRows: Int = DbSyncConfig.defaultMaxBatchRows
+    public var prefetchNextBatch: Bool = DbSyncConfig.defaultPrefetchNextBatch
     public var batchInterval: TimeInterval = 0
-    public var cpuRestRatio: Double = 1
-    public var backgroundCpuRestRatio: Double = 3
+    public var cpuRestRatio: Double = DbSyncConfig.defaultCpuRestRatio
+    public var backgroundCpuRestRatio: Double = DbSyncConfig.defaultBackgroundCpuRestRatio
     public var markAsSynced: Bool = false
     public var skipSyncedData: Bool = false
     public var keepLastData: Bool = false
@@ -133,9 +152,15 @@ public class DbSyncConfig {
     public var debugLevel: DbSyncDebugLevel = .info  // Default to info level
     public var completionHandler: DbSyncCompletionHandler? = nil
     public var progressHandler: DbSyncProgressHandler? = nil
+    public var batchHandler: ((SyncBatchMetrics) -> Void)? = nil
     public var dispatchQueue: DispatchQueue? = nil
     public var backgroundSession = false
-    public var compactDataFormat = DbSyncConfig.defaultCompactDataFormat
+    /// The compact data format was removed: rows are always uploaded one object per row.
+    @available(*, deprecated, message: "The compact data format was removed; this setting has no effect.")
+    public var compactDataFormat: Bool {
+        get { false }
+        set { }
+    }
     public var serverType: ServerType = DbSyncConfig.defaultServerType
     public var studyNumber: Int = DbSyncConfig.defaultStudyNumber
     public var studyKey: String = DbSyncConfig.defaultStudyKey
@@ -160,7 +185,9 @@ public class DbSyncConfig {
         c.keepDataAfterSync = keepDataAfterSync
         c.batchSize = batchSize
         c.maxBatchBytes = maxBatchBytes
+        c.maxBatchBytesCeiling = maxBatchBytesCeiling
         c.maxBatchRows = maxBatchRows
+        c.prefetchNextBatch = prefetchNextBatch
         c.batchInterval = batchInterval
         c.cpuRestRatio = cpuRestRatio
         c.backgroundCpuRestRatio = backgroundCpuRestRatio
@@ -172,9 +199,9 @@ public class DbSyncConfig {
         c.debugLevel = debugLevel
         c.completionHandler = completionHandler
         c.progressHandler = progressHandler
+        c.batchHandler = batchHandler
         c.dispatchQueue = dispatchQueue
         c.backgroundSession = backgroundSession
-        c.compactDataFormat = compactDataFormat
         c.serverType = serverType
         c.studyNumber = studyNumber
         c.studyKey = studyKey
@@ -203,8 +230,14 @@ public class DbSyncConfig {
         if let bytes = config["maxBatchBytes"] as? Int {
             self.maxBatchBytes = bytes
         }
+        if let bytes = config["maxBatchBytesCeiling"] as? Int {
+            self.maxBatchBytesCeiling = bytes
+        }
         if let rows = config["maxBatchRows"] as? Int {
             self.maxBatchRows = rows
+        }
+        if let prefetch = config["prefetchNextBatch"] as? Bool {
+            self.prefetchNextBatch = prefetch
         }
         if let interval = config["batchInterval"] as? Double {
             self.batchInterval = interval
@@ -256,12 +289,6 @@ public class DbSyncConfig {
             self.test = test
         }
 
-        if let compactDataFormat = config["compactDataFormat"] as? Bool {
-            self.compactDataFormat = compactDataFormat
-        } else if let compressionMode = config["compressionMode"] as? String {
-            self.compactDataFormat = compressionMode.lowercased() == "compact"
-        }
-
         if let studyNumber = config["studyNumber"] as? Int {
             self.studyNumber = studyNumber
         } else if let studyNumber = config["study_number"] as? Int {
@@ -285,6 +312,8 @@ public class DbSyncConfig {
                 self.serverType = .aware_micro
             } else if serverType == 4 {
                 self.serverType = .aware_light
+            } else if serverType == 5 {
+                self.serverType = .aware_hub
             } else {
                 self.serverType = .aware
             }

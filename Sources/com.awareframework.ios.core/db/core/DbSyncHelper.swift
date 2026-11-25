@@ -32,8 +32,6 @@ private struct DbSyncConstants {
     static let httpSuccessRange = 200..<300
     static let httpNotFoundStatus = 404
 
-    // Excluded fields for compact format
-    static let excludedCompactFields: Set<String> = ["os", "jsonVersion", "deviceId", "timezone"]
 }
 
 /// DbSyncUtils - Utility class for database synchronization
@@ -204,12 +202,6 @@ private enum ResponseResult {
     case serverError(Int)
 }
 
-/// Data format types
-private enum DataFormat {
-    case standard
-    case compact
-}
-
 /// DbSyncHelper - Main class for managing database synchronization
 ///
 /// This class handles data synchronization from local database to server.
@@ -291,6 +283,37 @@ open class DbSyncHelper: NSObject {
 
     /// Host key for the learned request size limit
     private var limitHost: String { AwareUtils.cleanHostName(host) }
+
+    // MARK: Diagnostics (SyncDiagnostics)
+
+    /// Times of the running sync, summarized when it ends
+    private lazy var recorder = SyncRunRecorder(table: tableName, host: limitHost)
+    /// Preparation time of the request in flight, and whether it was prefetched
+    private var currentPrepareSeconds: TimeInterval = 0
+    private var currentPrefetched = false
+    /// The size limit the request in flight was chosen with
+    private var currentLimitBytes = 0
+    /// When the request in flight was sent
+    private var requestStartedAt: Date?
+    /// Parts of the request in flight, from URLSessionTaskMetrics
+    private var currentTimings: (connect: TimeInterval?, upload: TimeInterval?, server: TimeInterval?,
+                                 download: TimeInterval?)?
+    private var currentDeleteSeconds: TimeInterval = 0
+    /// Phase by phase times of the request in flight
+    private var currentPhases = SyncPhaseTimes()
+    /// The finished request, recorded once the rest before the next one is known
+    private var pendingMetrics: SyncBatchMetrics?
+
+    // MARK: Prefetch (DbSyncConfig.prefetchNextBatch)
+
+    /// The next request, chosen and built while the current one was in flight
+    private struct Prefetch {
+        let afterId: Int64
+        let limit: Int
+        let batch: Batch
+        let seconds: TimeInterval
+    }
+    private var prefetched: Prefetch?
 
     /// Run `work` on the sync queue, with a lower priority while the app is in the background
     private func onSyncQueue(after delay: TimeInterval = 0, _ work: @escaping () -> Void) {
@@ -656,15 +679,33 @@ open class DbSyncHelper: NSObject {
             }
         }
 
-        // Choose the rows of this request: as many as fit in the size limit (on the sync queue)
-        let started = Date()
-        let batch = selectBatch()
-        batchWorkSeconds = Date().timeIntervalSince(started)
+        if recorder.startedAt == nil { recorder.startedAt = Date() }
+
+        // Choose the rows of this request: as many as fit in the size limit (on the sync queue).
+        // A request prefetched while the previous one was in flight is used when it starts right
+        // after the uploaded rows and was chosen with the same limit.
+        let limit = SyncBatchLimit.current(host: limitHost, config: config)
+        let batch: Batch
+        if let p = prefetched, p.afterId == lastUploadedId, p.limit == limit {
+            batch = p.batch
+            batchWorkSeconds = 0
+            currentPrepareSeconds = p.seconds
+            currentPrefetched = true
+        } else {
+            let started = Date()
+            batch = selectBatch(afterId: lastUploadedId, limit: limit)
+            batchWorkSeconds = Date().timeIntervalSince(started)
+            currentPrepareSeconds = batchWorkSeconds
+            currentPrefetched = false
+        }
+        prefetched = nil
+        currentLimitBytes = limit
+        currentPhases = batch.phases
 
         if config.debug {
             logVerbose(
                 "→ performDataSync() selected \(batch.count) rows"
-                + (batch.body.map { " (\($0.utf8.count) bytes)" } ?? "") + ", last batch: \(batch.isLast)")
+                + (batch.body.map { " (\($0.count) bytes)" } ?? "") + ", last batch: \(batch.isLast)")
         }
 
         send(count: batch.count, lastId: batch.lastId, rows: batch.rows, body: batch.body, isLast: batch.isLast)
@@ -680,9 +721,19 @@ open class DbSyncHelper: NSObject {
         /// The rows, kept only when the body is built by `buildRequestBody(from:)`
         var rows: [[String: Any]]?
         /// The request body, or nil when it is built by `buildRequestBody(from:)`
-        var body: String?
+        var body: Data?
         var isLast: Bool
+        /// Time of each phase of choosing the rows and building the body
+        var phases = SyncPhaseTimes()
     }
+
+    /// Rows whose size is measured together: a group that fits in the limit is taken as a whole,
+    /// and only the group at the edge of the limit is measured row by row. For the legacy AWARE
+    /// server the size is the URL-encoded size, which is costly to compute for every row.
+    /// (Changeable for tests and benchmarks.)
+    public static var sizeGroupRows = 100
+
+
 
     /// Choose the rows of the next request.
     ///
@@ -692,65 +743,124 @@ open class DbSyncHelper: NSObject {
     /// and the JSON is reused for the body. Only the JSON is kept, not the rows, so memory stays near
     /// the size of the body. The first row is always taken, so a sync makes progress.
     ///
-    /// With `compactDataFormat` or `createHttpRequestBodyHandler` the body is not the sum of its rows,
-    /// so it is built with `buildRequestBody(from:)` and rows are removed until it fits.
-    private func selectBatch() -> Batch {
-        let limit = SyncBatchLimit.current(host: limitHost, config: config)
+    /// With `createHttpRequestBodyHandler` the body is not the sum of its rows, so it is built with
+    /// `buildRequestBody(from:)` and rows are removed until it fits.
+    private func selectBatch(afterId start: Int64, limit: Int) -> Batch {
+        let cpuStart = SyncClock.threadCPU()
+        var phases = SyncPhaseTimes()
+        var batch = selectBatchRows(afterId: start, limit: limit, phases: &phases)
+        phases.prepareCPU = SyncClock.seconds(SyncClock.threadCPU() &- cpuStart)
+        batch.phases = phases
+        return batch
+    }
+
+    private func selectBatchRows(afterId start: Int64, limit: Int, phases: inout SyncPhaseTimes) -> Batch {
         let maxRows = max(1, config.maxBatchRows)
         let chunk = max(1, min(config.batchSize, maxRows))
         let form = !usesNewAwareServerEndpoint
-        let separator = form ? formEncodedLength(",") : 1
-        let exact = !config.compactDataFormat && createHttpRequestBodyHandler == nil
+        let separator = 1  // "," (not encoded in the form either)
+        let exact = createHttpRequestBodyHandler == nil
 
         var rows: [[String: Any]] = []   // only when !exact
-        var pieces: [String] = []
+        var data: [UInt8] = []           // the rows' JSON joined with ",", when exact
+        if exact { data.reserveCapacity(min(limit, 16_000_000)) }
+        var chunkBuffer: [UInt8] = []
         var count = 0
         var lastId: Int64?
-        var total = 0
-        if exact {
-            // Size with no rows: the envelope with an empty data array (see assembleBody)
-            total = form ? formEnvelopeLength() : jsonEnvelope().utf8.count + ",\"data\":[]".utf8.count
-        }
-        var afterId = lastUploadedId
+        // Size with no rows: the envelope with an empty data array (see assembleBody)
+        var total = exact ? emptyBodySize(form: form) : 0
+        var afterId = start
         var more = true
         var invalid = false
+
+        /// Size of a row in the body (URL-encoded for the legacy AWARE server)
+        func size(_ bytes: UnsafeBufferPointer<UInt8>) -> Int {
+            form ? FormEncoding.encodedLength(bytes) : bytes.count
+        }
 
         reading: while count < maxRows {
             let want = min(chunk, maxRows - count)
             var stop = false
             let fetchedCount: Int = autoreleasepool {
-                // Fast path: the engine writes each row's JSON without a dictionary per row
-                if exact, let encoded = getUploadCandidateJSON(lastUploadedId: afterId, limit: want) {
-                    for row in encoded {
-                        guard let json = row.json else {
-                            invalid = true
-                            stop = true
-                            break
-                        }
-                        let size = (form ? formEncodedLength(json) : json.utf8.count) + (pieces.isEmpty ? 0 : separator)
-                        if count > 0 && total + size > limit {
-                            stop = true
-                            break
-                        }
-                        pieces.append(json)
-                        total += size
-                        count += 1
-                        lastId = row.id
+                // Fast path: the engine writes the rows' JSON into one byte buffer
+                let fetchStart = SyncClock.now()
+                chunkBuffer.removeAll(keepingCapacity: true)
+                if exact, let spans = appendUploadCandidateJSON(lastUploadedId: afterId, limit: want, to: &chunkBuffer) {
+                    if let t = engine.lastUploadJSONTiming {
+                        phases.dbWait += t.queueWait
+                        phases.dbRead += t.read
+                        phases.jsonEncode += t.encode
+                    } else {
+                        phases.dbRead += SyncClock.since(fetchStart)
                     }
-                    return encoded.count
+                    let sizeStart = SyncClock.now()
+                    defer { phases.sizeCheck += SyncClock.since(sizeStart) }
+                    chunkBuffer.withUnsafeBufferPointer { buffer in
+                        func bytes(_ span: UploadRowSpan) -> UnsafeBufferPointer<UInt8> {
+                            UnsafeBufferPointer(rebasing: buffer[span.range!])
+                        }
+                        func take(_ span: UploadRowSpan) {
+                            if !data.isEmpty { data.append(UInt8(ascii: ",")) }
+                            data.append(contentsOf: bytes(span))
+                        }
+                        var i = 0
+                        groups: while i < spans.count {
+                            var end = min(i + Self.sizeGroupRows, spans.count)
+                            // A row that cannot be written as JSON ends the fast path (see below)
+                            if let bad = spans[i..<end].firstIndex(where: { $0.range == nil }) {
+                                if bad == i {
+                                    invalid = true
+                                    stop = true
+                                    break groups
+                                }
+                                end = bad
+                            }
+                            let group = spans[i..<end]
+                            var groupSize = (data.isEmpty ? 0 : separator) + separator * (group.count - 1)
+                            for span in group { groupSize += size(bytes(span)) }
+                            if total + groupSize <= limit {
+                                // The whole group fits
+                                group.forEach(take)
+                                total += groupSize
+                                count += group.count
+                                lastId = group.last?.id
+                                i = end
+                                continue
+                            }
+                            // The edge of the limit: row by row
+                            for span in group {
+                                let rowSize = size(bytes(span)) + (data.isEmpty ? 0 : separator)
+                                if count > 0 && total + rowSize > limit {
+                                    stop = true
+                                    break groups
+                                }
+                                take(span)
+                                total += rowSize
+                                count += 1
+                                lastId = span.id
+                            }
+                            i = end
+                        }
+                    }
+                    return spans.count
                 }
                 let fetched = getUploadCandidates(lastUploadedId: afterId, limit: want)
+                phases.dbRead += SyncClock.since(fetchStart)
+                let encodeStart = SyncClock.now()
+                defer { phases.jsonEncode += SyncClock.since(encodeStart) }
                 for row in fetched {
                     if !exact {
                         rows.append(row)
                     } else if let json = rowJSON(row) {
-                        let size = (form ? formEncodedLength(json) : json.utf8.count) + (pieces.isEmpty ? 0 : separator)
-                        if count > 0 && total + size > limit {
+                        var json = json
+                        let rowSize = json.withUTF8 { size($0) } + (data.isEmpty ? 0 : separator)
+                        if count > 0 && total + rowSize > limit {
                             stop = true
                             break
                         }
-                        pieces.append(json)
-                        total += size
+                        if !data.isEmpty { data.append(UInt8(ascii: ",")) }
+                        data.append(contentsOf: json.utf8)
+                        total += rowSize
                     } else {
                         // Not valid JSON: fall back to buildRequestBody, which reports the error
                         invalid = true
@@ -773,14 +883,19 @@ open class DbSyncHelper: NSObject {
         }
 
         if exact && !invalid {
-            return Batch(count: count, lastId: lastId, rows: nil, body: assembleBody(pieces, form: form), isLast: !more)
+            let assembleStart = SyncClock.now()
+            let body = assembleBody(data, form: form)
+            phases.assemble += SyncClock.since(assembleStart)
+            return Batch(count: count, lastId: lastId, rows: nil, body: body, isLast: !more)
         }
         if invalid {
             // Read the same rows again as dictionaries for buildRequestBody
-            rows = getUploadCandidates(lastUploadedId: lastUploadedId, limit: min(chunk, maxRows))
+            rows = getUploadCandidates(lastUploadedId: start, limit: min(chunk, maxRows))
             more = true
         }
         // Build with the general builder, and remove rows until the body fits
+        let assembleStart = SyncClock.now()
+        defer { phases.assemble += SyncClock.since(assembleStart) }
         for _ in 0..<4 {
             guard rows.count > 1, let body = try? buildRequestBody(from: rows) else { break }
             let bytes = body.utf8.count
@@ -812,34 +927,35 @@ open class DbSyncHelper: NSObject {
         return String(data: data, encoding: .utf8) ?? "{}"
     }
 
-    /// Length of the form body with an empty data array (legacy AWARE server)
-    private func formEnvelopeLength() -> Int {
-        buildFormRequestBody(["device_id": AwareUtils.getCommonDeviceId(), "data": "[]"]).utf8.count
-    }
-
-    /// Length of `text` after URL encoding as a form value. Encoding is per character, so the encoded
-    /// lengths of the rows add up to the encoded length of the data array.
-    private func formEncodedLength(_ text: String) -> Int {
-        buildFormRequestBody(["v": text]).utf8.count - "v=".utf8.count
-    }
-
-    /// The request body from the rows' JSON, in the same form `buildRequestBody(from:)` produces
-    private func assembleBody(_ pieces: [String], form: Bool) -> String {
+    /// Size of the body with no rows (see `assembleBody`)
+    private func emptyBodySize(form: Bool) -> Int {
         if form {
-            let data = "[" + pieces.joined(separator: ",") + "]"
-            return buildFormRequestBody(["device_id": AwareUtils.getCommonDeviceId(), "data": data])
+            return FormEncoding.body([("device_id", AwareUtils.getCommonDeviceId()), ("data", "[]")]).utf8.count
         }
-        // One buffer of the final size, instead of joining and then concatenating copies
-        let head = String(jsonEnvelope().dropLast()) + ",\"data\":["
-        var body = ""
-        body.reserveCapacity(head.utf8.count + pieces.reduce(0) { $0 + $1.utf8.count } + pieces.count + 2)
-        body.append(head)
-        for (i, piece) in pieces.enumerated() {
-            if i > 0 { body.append(",") }
-            body.append(piece)
+        return jsonEnvelope().utf8.count + ",\"data\":[]".utf8.count
+    }
+
+    /// The request body from the rows' JSON joined with ",", in the same form
+    /// `buildRequestBody(from:)` produces
+    private func assembleBody(_ rows: [UInt8], form: Bool) -> Data {
+        var out: [UInt8] = []
+        if form {
+            out.reserveCapacity(rows.count + rows.count / 2 + 128)
+            FormEncoding.append("device_id", to: &out)
+            out.append(UInt8(ascii: "="))
+            FormEncoding.append(AwareUtils.getCommonDeviceId(), to: &out)
+            out.append(contentsOf: Array("&data=".utf8))
+            FormEncoding.append("[", to: &out)
+            rows.withUnsafeBufferPointer { FormEncoding.append($0, to: &out) }
+            FormEncoding.append("]", to: &out)
+        } else {
+            let head = String(jsonEnvelope().dropLast()) + ",\"data\":["
+            out.reserveCapacity(head.utf8.count + rows.count + 2)
+            out.append(contentsOf: head.utf8)
+            out.append(contentsOf: rows)
+            out.append(contentsOf: Array("]}".utf8))
         }
-        body.append("]}")
-        return body
+        return Data(out)
     }
 
     // MARK: - Data Management
@@ -871,6 +987,14 @@ open class DbSyncHelper: NSObject {
      * A subclass that overrides `getUploadCandidates` to change the rows must override this too
      * (returning nil is enough), or the rows it changes are uploaded unchanged.
      */
+    /// The rows of `getUploadCandidateJSON(lastUploadedId:limit:)`, written into `buffer` (appended).
+    /// The sync builds its requests from these bytes. A subclass that overrides `getUploadCandidates`
+    /// to change the rows must override this too (returning nil is enough).
+    open func appendUploadCandidateJSON(lastUploadedId: Int64, limit: Int, to buffer: inout [UInt8]) -> [UploadRowSpan]? {
+        let omitting: Set<String> = config.serverType == .aware_light ? ["id"] : []
+        return engine.appendUploadJSON(afterId: lastUploadedId, limit: limit, omitting: omitting, to: &buffer)
+    }
+
     open func getUploadCandidateJSON(lastUploadedId: Int64, limit: Int) -> [UploadRowJSON]? {
         let omitting: Set<String> = config.serverType == .aware_light ? ["id"] : []
         return engine.fetchUploadJSON(afterId: lastUploadedId, limit: limit, omitting: omitting)
@@ -934,25 +1058,7 @@ open class DbSyncHelper: NSObject {
             uploadCandidate.removeValue(forKey: "id")
             return uploadCandidate
         }
-        let payloadData: Any
-
-        // Compact data format processing
-        if self.config.compactDataFormat {
-            // Aggregate data by column (to reduce transfer volume)
-            var aggregatedData: [String: [Any]] = [:]
-            for dict in uploadCandidates {
-                for (key, value) in dict {
-                    // Exclude common system fields
-                    if !DbSyncConstants.excludedCompactFields.contains(key) {
-                        aggregatedData[key, default: []].append(value)
-                    }
-                }
-            }
-            payloadData = aggregatedData
-        } else {
-            // Standard format (row by row)
-            payloadData = uploadCandidates
-        }
+        let payloadData: Any = uploadCandidates
 
         let jsonData = try JSONSerialization.data(withJSONObject: payloadData, options: [])
         let data = String(data: jsonData, encoding: .utf8)!
@@ -970,8 +1076,8 @@ open class DbSyncHelper: NSObject {
         } else {
             // Build request body in URL-encoded format for legacy AWARE server.
             requestStr = buildFormRequestBody([
-                "device_id": deviceId,
-                "data": data,
+                ("device_id", deviceId),
+                ("data", data),
             ])
         }
 
@@ -983,10 +1089,10 @@ open class DbSyncHelper: NSObject {
         return requestStr
     }
 
-    private func buildFormRequestBody(_ parameters: [String: String]) -> String {
-        var components = URLComponents()
-        components.queryItems = parameters.map { URLQueryItem(name: $0.key, value: $0.value) }
-        return components.percentEncodedQuery ?? ""
+    /// A form body (`application/x-www-form-urlencoded`), fields in the given order. `+` is encoded
+    /// (see `FormEncoding`).
+    private func buildFormRequestBody(_ fields: [(String, String)]) -> String {
+        FormEncoding.body(fields)
     }
 
     /**
@@ -995,7 +1101,7 @@ open class DbSyncHelper: NSObject {
      * @param requestBody Request body
      * @return Built URLRequest
      */
-    private func buildHTTPRequest(with requestBody: String) -> URLRequest? {
+    func buildHTTPRequest(with requestBody: Data) -> URLRequest? {
         // Send HTTP request
         var hostName = AwareUtils.cleanHostName(self.host)
         while hostName.hasSuffix("/") {
@@ -1006,7 +1112,12 @@ open class DbSyncHelper: NSObject {
         }
 
         let urlString: String
-        if config.serverType == .aware_micro {
+        if config.serverType == .aware_hub {
+            let safeStudyKey =
+                config.studyKey.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed)
+                ?? config.studyKey
+            urlString = "https://\(hostName)/v1/\(config.studyNumber)/\(safeStudyKey)/insert"
+        } else if config.serverType == .aware_micro {
             let safeStudyKey =
                 config.studyKey.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed)
                 ?? config.studyKey
@@ -1032,7 +1143,15 @@ open class DbSyncHelper: NSObject {
         // Configure HTTP request
         var request = URLRequest(url: url)
         request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-        request.httpBody = requestBody.data(using: .utf8)
+        request.httpBody = requestBody
+        if config.serverType == .aware_hub {
+            // The body compressed (sensor data shrinks to 5-15%). The request size limits apply
+            // to the body before compression, as the server checks the decompressed size.
+            if let compressed = Self.deflate(requestBody) {
+                request.httpBody = compressed
+                request.setValue("deflate", forHTTPHeaderField: "Content-Encoding")
+            }
+        }
         request.timeoutInterval = DbSyncConstants.requestTimeout
         request.httpMethod = "POST"
         request.allowsCellularAccess = true
@@ -1051,9 +1170,19 @@ open class DbSyncHelper: NSObject {
         return request
     }
 
+    /// The body compressed with deflate (raw deflate, which the server takes as
+    /// `Content-Encoding: deflate`), or nil when compression fails
+    static func deflate(_ data: Data) -> Data? {
+        guard data.isEmpty == false else { return nil }
+        if #available(iOS 13.0, watchOS 6.0, macOS 10.15, *) {
+            return try? (data as NSData).compressed(using: .zlib) as Data
+        }
+        return nil
+    }
+
     private var usesNewAwareServerEndpoint: Bool {
         switch config.serverType {
-        case .aware_micro, .aware_light:
+        case .aware_micro, .aware_light, .aware_hub:
             return true
         case .none, .aware:
             return false
@@ -1089,6 +1218,9 @@ open class DbSyncHelper: NSObject {
      */
     private func handleSyncCompletion(success: Bool, error: Error?) {
         guard isStopRequested == false else { return }
+        prefetched = nil
+        recordPendingMetrics(rest: 0)
+        emitSummary(success: success)
         // Set final state
         if success {
             syncState = .completed
@@ -1138,6 +1270,7 @@ open class DbSyncHelper: NSObject {
         if config.debug {
             logVerbose(String(format: "Next batch in %.3f s (work %.3f s)", rest, batchWorkSeconds))
         }
+        recordPendingMetrics(rest: rest)
         onSyncQueue(after: rest) { [weak self] in
             guard self?.isStopRequested == false else { return }
             // Calculate and report progress
@@ -1192,7 +1325,7 @@ open class DbSyncHelper: NSObject {
 
     /// Send one request of `count` rows ending with row `lastId`. The body is `body` when it was already
     /// built, otherwise it is built from `rows`.
-    private func send(count: Int, lastId: Int64?, rows: [[String: Any]]?, body prebuiltBody: String?, isLast: Bool) {
+    private func send(count: Int, lastId: Int64?, rows: [[String: Any]]?, body prebuiltBody: Data?, isLast: Bool) {
         guard isStopRequested == false else { return }
         if config.debug {
             logVerbose("upload() started with \(count) candidates")
@@ -1216,6 +1349,7 @@ open class DbSyncHelper: NSObject {
         // If data is empty, process as sync completed
         if count == 0 {
             syncState = .completed
+            emitSummary(success: true)
             if self.config.debug {
                 logInfo("A sync process is done: No Data")
             }
@@ -1252,17 +1386,27 @@ open class DbSyncHelper: NSObject {
         do {
             // Build HTTP request body (unless it was built while choosing the rows)
             let started = Date()
-            let requestBody = try prebuiltBody ?? buildRequestBody(from: rows ?? [])
-            batchWorkSeconds += Date().timeIntervalSince(started)
-            currentBodyBytes = requestBody.utf8.count
+            let requestBody = try prebuiltBody ?? Data(buildRequestBody(from: rows ?? []).utf8)
+            let buildSeconds = Date().timeIntervalSince(started)
+            batchWorkSeconds += buildSeconds
+            if !currentPrefetched { currentPrepareSeconds += buildSeconds }
+            if prebuiltBody == nil { currentPhases.assemble += buildSeconds }
+            currentBodyBytes = requestBody.count
+            requestStartedAt = Date()
+            currentTimings = nil
+            currentDeleteSeconds = 0
 
             // Build HTTP request
-            if let request = buildHTTPRequest(with: requestBody) {
+            let requestStart = SyncClock.now()
+            let builtRequest = buildHTTPRequest(with: requestBody)
+            currentPhases.toData = SyncClock.since(requestStart)
+            if let request = builtRequest {
                 guard isStopRequested == false else { return }
                 if self.config.test {
                     // Test mode should not leave synthetic URLSession tasks behind.
                     // A suspended task is later returned by getAllTasks() and can be
                     // cancelled as a real network failure during the next batch.
+                    schedulePrefetch(after: lastId, isLast: isLast)
                     handleSuccessfulUploadCompletion()
                     return
                 }
@@ -1286,6 +1430,9 @@ open class DbSyncHelper: NSObject {
                 // Send actual HTTP request
                 task.resume()
                 stopLock.unlock()
+
+                // Prepare the next request while this one is in flight
+                schedulePrefetch(after: lastId, isLast: isLast)
             }
         } catch {
             // Handle JSON serialization error
@@ -1294,6 +1441,8 @@ open class DbSyncHelper: NSObject {
             }
             // Stop sync on error and call callback
             syncState = .failed(error)
+            prefetched = nil
+            emitSummary(success: false)
             if let callback = self.completion {
                 DispatchQueue.main.async { [weak self] in
                     guard self?.isStopRequested == false else { return }
@@ -1323,11 +1472,14 @@ open class DbSyncHelper: NSObject {
         }
 
         if config.removeAfterSync {
+            let started = Date()
             removeUploadedCandidates(lastUploadedId: lastUploadedId, limit: config.batchSize)
+            currentDeleteSeconds = Date().timeIntervalSince(started)
         }
 
         updateLastUploadedId()
         receivedData = Data()
+        pendingMetrics = makeMetrics(success: true)
         handleUploadCompletion(responseState: true, error: nil)
     }
 
@@ -1528,6 +1680,9 @@ open class DbSyncHelper: NSObject {
         if !responseState, let delay = retryDelayAfterFailure(error: error) {
             invalidateSession(waitForTasks: false)
             receivedData = Data()
+            prefetched = nil
+            pendingMetrics = makeMetrics(success: false)
+            recordPendingMetrics(rest: delay, isRetryWait: true)
             onSyncQueue(after: delay) { [weak self] in
                 self?.performDataSync()
             }
@@ -1535,7 +1690,11 @@ open class DbSyncHelper: NSObject {
         }
         if responseState {
             adjustRetries = 0
-            SyncBatchLimit.recordSuccess(host: limitHost)
+            let networkSeconds = requestStartedAt.map { Date().timeIntervalSince($0) } ?? 0
+            if let grown = SyncBatchLimit.recordSuccess(host: limitHost, bodyBytes: currentBodyBytes,
+                                                        networkSeconds: networkSeconds, config: config) {
+                logInfo("Requests are full and fast; the size limit grows to \(grown) bytes")
+            }
         }
 
         // Debug output of server response
@@ -1565,7 +1724,8 @@ open class DbSyncHelper: NSObject {
             if config.removeAfterSync {
                 let started = Date()
                 removeUploadedCandidates(lastUploadedId: lastUploadedId, limit: config.batchSize)
-                batchWorkSeconds += Date().timeIntervalSince(started)
+                currentDeleteSeconds = Date().timeIntervalSince(started)
+                batchWorkSeconds += currentDeleteSeconds
             }
 
             // Finally update uploaded ID
@@ -1578,8 +1738,168 @@ open class DbSyncHelper: NSObject {
         // Clear received data buffer
         receivedData = Data()
 
+        pendingMetrics = makeMetrics(success: responseState)
+
         // Execute subsequent processing
         handleUploadCompletion(responseState: responseState, error: error)
+    }
+
+    /// Timings of the connection, the body, the server and the response (called before
+    /// `didCompleteWithError`)
+    open func urlSession(
+        _ session: URLSession, task: URLSessionTask, didFinishCollecting metrics: URLSessionTaskMetrics
+    ) {
+        guard let t = metrics.transactionMetrics.last else { return }
+        func span(_ a: Date?, _ b: Date?) -> TimeInterval? {
+            guard let a, let b else { return nil }
+            return max(0, b.timeIntervalSince(a))
+        }
+        // A reused connection has no connect dates: nothing was spent on connecting
+        let connect = t.isReusedConnection ? 0 : (span(t.fetchStartDate, t.connectEndDate) ?? 0)
+        currentTimings = (connect, span(t.requestStartDate, t.requestEndDate),
+                          span(t.requestEndDate, t.responseStartDate),
+                          span(t.responseStartDate, t.responseEndDate))
+    }
+
+    // MARK: - Diagnostics and prefetch
+
+    /// The metrics of the request that just ended
+    private func makeMetrics(success: Bool) -> SyncBatchMetrics {
+        let processInfo = ProcessInfo.processInfo
+        var phases = currentPhases
+        phases.delete = currentDeleteSeconds
+        let load = SyncDiagnostics.shared.sampleLoad()
+        return SyncBatchMetrics(
+            table: tableName, host: limitHost, date: Date(), rows: currentNumOfCandidates,
+            bodyBytes: currentBodyBytes, limitBytes: currentLimitBytes,
+            prepareSeconds: currentPrepareSeconds, prefetched: currentPrefetched,
+            networkSeconds: config.test ? 0 : (requestStartedAt.map { Date().timeIntervalSince($0) } ?? 0),
+            connectSeconds: currentTimings?.connect, uploadSeconds: currentTimings?.upload,
+            serverSeconds: currentTimings?.server, downloadSeconds: currentTimings?.download,
+            deleteSeconds: currentDeleteSeconds, restSeconds: 0, statusCode: lastStatusCode,
+            success: success, background: SyncAppState.shared.isInBackground,
+            lowPower: processInfo.isLowPowerModeEnabled, thermalState: processInfo.thermalState,
+            phases: phases, appCPUPercent: load.cpuPercent, memoryMB: load.memoryMB)
+    }
+
+    /// Record the request that ended, with the rest (or retry wait) that follows it
+    private func recordPendingMetrics(rest: TimeInterval, isRetryWait: Bool = false) {
+        guard let m = pendingMetrics else { return }
+        pendingMetrics = nil
+        let metrics = SyncBatchMetrics(
+            table: m.table, host: m.host, date: m.date, rows: m.rows, bodyBytes: m.bodyBytes,
+            limitBytes: m.limitBytes, prepareSeconds: m.prepareSeconds, prefetched: m.prefetched,
+            networkSeconds: m.networkSeconds, connectSeconds: m.connectSeconds,
+            uploadSeconds: m.uploadSeconds, serverSeconds: m.serverSeconds,
+            downloadSeconds: m.downloadSeconds, deleteSeconds: m.deleteSeconds, restSeconds: rest,
+            statusCode: m.statusCode, success: m.success, background: m.background,
+            lowPower: m.lowPower, thermalState: m.thermalState,
+            phases: m.phases, appCPUPercent: m.appCPUPercent, memoryMB: m.memoryMB)
+        recorder.add(metrics, isRetryWait: isRetryWait)
+        SyncDiagnostics.shared.record(metrics)
+        config.batchHandler?(metrics)
+        logInfo("Request: \(metrics)")
+    }
+
+    /// Publish the summary of the sync that ended and start a new one
+    private func emitSummary(success: Bool) {
+        if let summary = recorder.summary(success: success) {
+            SyncDiagnostics.shared.record(summary)
+            logInfo("Summary: \(summary)")
+        }
+        recorder = SyncRunRecorder(table: tableName, host: limitHost)
+    }
+
+    // MARK: - Benchmark
+
+    /// Prepare up to `batches` requests from the rows not uploaded yet, as a sync would (reading
+    /// the rows, writing them as JSON, measuring their size, building the body and its bytes), and
+    /// return what each took (`SyncBatchMetrics.phases`). Nothing is sent, and nothing changes:
+    /// neither the rows, nor the sync marker. Call it off the main thread.
+    public func benchmarkPreparation(batches: Int) -> [SyncBatchMetrics] {
+        var afterId = DbSyncUtils.validatedLastUploadedId(
+            forKey: markerKey, maxAssignedId: engine.maxAssignedId(tableName: tableName))
+        let limit = SyncBatchLimit.current(host: limitHost, config: config)
+        var results: [SyncBatchMetrics] = []
+        for _ in 0..<max(0, batches) {
+            let started = SyncClock.now()
+            var batch = selectBatch(afterId: afterId, limit: limit)
+            guard batch.count > 0, let lastId = batch.lastId else { break }
+            if batch.body == nil, let rows = batch.rows {
+                let buildStart = SyncClock.now()
+                batch.body = (try? buildRequestBody(from: rows)).map { Data($0.utf8) }
+                batch.phases.assemble += SyncClock.since(buildStart)
+            }
+            let dataStart = SyncClock.now()
+            let bytes = batch.body?.count ?? 0
+            batch.phases.toData = SyncClock.since(dataStart)
+            let processInfo = ProcessInfo.processInfo
+            let load = SyncDiagnostics.shared.sampleLoad()
+            results.append(SyncBatchMetrics(
+                table: tableName, host: limitHost, date: Date(), rows: batch.count, bodyBytes: bytes,
+                limitBytes: limit, prepareSeconds: SyncClock.since(started), prefetched: false,
+                networkSeconds: 0, connectSeconds: nil, uploadSeconds: nil, serverSeconds: nil,
+                downloadSeconds: nil, deleteSeconds: 0, restSeconds: 0, statusCode: nil, success: true,
+                background: SyncAppState.shared.isInBackground, lowPower: processInfo.isLowPowerModeEnabled,
+                thermalState: processInfo.thermalState, phases: batch.phases,
+                appCPUPercent: load.cpuPercent, memoryMB: load.memoryMB))
+            if batch.isLast { break }
+            afterId = lastId
+        }
+        return results
+    }
+
+    /// A request a sync would send next, for checks (see `previewRequests(batches:)`)
+    public struct PreviewRequest {
+        public let rows: Int
+        public let firstId: Int64
+        public let lastId: Int64
+        public let limitBytes: Int
+        public let body: Data
+    }
+
+    /// The bodies of the next `batches` requests a sync would send, built from the rows not uploaded
+    /// yet, without sending them and without changing anything (rows, sync marker). Call it off the
+    /// main thread.
+    public func previewRequests(batches: Int) -> [PreviewRequest] {
+        var afterId = DbSyncUtils.validatedLastUploadedId(
+            forKey: markerKey, maxAssignedId: engine.maxAssignedId(tableName: tableName))
+        let limit = SyncBatchLimit.current(host: limitHost, config: config)
+        var results: [PreviewRequest] = []
+        for _ in 0..<max(0, batches) {
+            var batch = selectBatch(afterId: afterId, limit: limit)
+            guard batch.count > 0, let lastId = batch.lastId else { break }
+            if batch.body == nil, let rows = batch.rows {
+                batch.body = (try? buildRequestBody(from: rows)).map { Data($0.utf8) }
+            }
+            guard let body = batch.body else { break }
+            let firstId = engine.fetch(filter: "id > \(afterId)", limit: 1)?.first?["id"] as? Int64 ?? afterId + 1
+            results.append(PreviewRequest(rows: batch.count, firstId: firstId, lastId: lastId, limitBytes: limit, body: body))
+            if batch.isLast { break }
+            afterId = lastId
+        }
+        return results
+    }
+
+    /// Choose and build the request after the rows ending with `lastId` on the sync queue, so it is
+    /// ready when the current request ends. The sync queue is serial, so this runs before the
+    /// response of the current request is handled.
+    private func schedulePrefetch(after lastId: Int64?, isLast: Bool) {
+        guard config.prefetchNextBatch, !isLast, let afterId = lastId, currentLimitBytes > 0 else { return }
+        let limit = currentLimitBytes
+        onSyncQueue { [weak self] in
+            guard let self, self.isStopRequested == false, self.prefetched == nil else { return }
+            let started = Date()
+            var batch = self.selectBatch(afterId: afterId, limit: limit)
+            guard batch.count > 0 else { return }
+            if batch.body == nil, let rows = batch.rows {
+                let buildStart = SyncClock.now()
+                batch.body = (try? self.buildRequestBody(from: rows)).map { Data($0.utf8) }
+                batch.phases.assemble += SyncClock.since(buildStart)
+            }
+            self.prefetched = Prefetch(afterId: afterId, limit: limit, batch: batch,
+                                       seconds: Date().timeIntervalSince(started))
+        }
     }
 
     /// Whether to send the batch again after a failure, and after how long.
